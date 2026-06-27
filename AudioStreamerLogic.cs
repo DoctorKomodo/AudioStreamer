@@ -17,7 +17,7 @@ namespace AudioStreamer
         public class Config
         {
             public ModeType Mode { get; set; } = ModeType.Receiver;
-            public string HostName { get; set; } = "192.168.1.100";
+            public string HostName { get; set; } = "";   // blank by default so first-run users must enter the receiver's IP
             public int Port { get; set; } = 5005;
             public int SenderAudioBufferMillisecondsLength { get; set; } = 100;
             public int ReceiverAudioBufferMillisecondsLength { get; set; } = 1000;
@@ -26,7 +26,7 @@ namespace AudioStreamer
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;
             public int Channels { get; set; } = 2;
-            public bool StartMinimized { get; set; } = true;
+            public bool StartMinimized { get; set; } = false;   // first run shows the window so it can be configured before starting
         }
 
         public Config CurrentConfig { get; set; } = new();

@@ -87,6 +87,15 @@ namespace AudioStreamer
         {
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
+
+            // Friendly guard for the common first-run mistake: a blank/invalid sender target.
+            if (audioStreamerLogic.CurrentConfig.Mode == AudioStreamerLogic.ModeType.Sender
+                && !System.Net.IPAddress.TryParse(audioStreamerLogic.CurrentConfig.HostName, out _))
+            {
+                ReportStartFailure("Enter the receiver's IP address (Host Name).", showErrorsAsDialog);
+                return;
+            }
+
             try
             {
                 audioStreamerLogic.Start();
@@ -94,12 +103,17 @@ namespace AudioStreamer
             }
             catch (Exception ex)
             {
-                if (showErrorsAsDialog)
-                    MessageBox.Show($"Could not start: {ex.Message}", "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
-                else
-                    trayIcon?.ShowBalloonTip(5000, "AudioStreamer", $"Could not start: {ex.Message}", System.Windows.Forms.ToolTipIcon.Warning);
-                SetRunningState(false);
+                ReportStartFailure($"Could not start: {ex.Message}", showErrorsAsDialog);
             }
+        }
+
+        private void ReportStartFailure(string message, bool showErrorsAsDialog)
+        {
+            if (showErrorsAsDialog)
+                MessageBox.Show(message, "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
+            else
+                trayIcon?.ShowBalloonTip(5000, "AudioStreamer", message, System.Windows.Forms.ToolTipIcon.Warning);
+            SetRunningState(false);
         }
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
