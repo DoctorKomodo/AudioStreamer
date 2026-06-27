@@ -36,6 +36,10 @@ You run one copy on each machine and give each a role with the **Mode** dropdown
 
 That's it — whatever plays on the Sender now comes out of the Receiver's speakers. Click **Stop** on either end to end the session; settings are saved automatically.
 
+### Running in the background
+
+Minimizing the window sends AudioStreamer to the **system tray** (double-click the tray icon, or right-click → **Show**, to bring it back; **Exit** quits). Tick **Start Minimized** to have it launch straight to the tray and begin streaming with your saved settings, and **Start with Windows** to launch it automatically at login. During installation you can also tick "Start AudioStreamer automatically when Windows starts" to set the same option.
+
 > **Firewall:** the first time the Receiver binds its port, Windows may prompt to allow AudioStreamer through the firewall — allow it on **Private networks**. If you see no audio, check that UDP on the chosen port is permitted on the Receiver.
 
 ---

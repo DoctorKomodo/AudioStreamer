@@ -1,19 +1,65 @@
 ﻿using System.Windows;
 using System.Windows.Controls;
+// UseWindowsForms adds a global using for System.Windows.Forms, which makes
+// MessageBox ambiguous; pin it to the WPF one.
+using MessageBox = System.Windows.MessageBox;
 
 namespace AudioStreamer
 {
     public partial class MainWindow : Window
     {
         private AudioStreamerLogic audioStreamerLogic;
+        private StartupService startupService;
+        private bool suppressStartupToggle;
+        private System.Windows.Forms.NotifyIcon? trayIcon;
 
         public MainWindow()
         {
             InitializeComponent();
             audioStreamerLogic = new AudioStreamerLogic();
+            startupService = new StartupService();
+            SetupTrayIcon();
             PopulateUIFromConfig();
             this.Closing += Window_Closing;
+            this.StateChanged += MainWindow_StateChanged;
+            this.Loaded += MainWindow_Loaded;
             SetRunningState(false);
+        }
+
+        private void SetupTrayIcon()
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            string? resName = System.Array.Find(asm.GetManifestResourceNames(),
+                n => n.EndsWith("icon.ico", System.StringComparison.OrdinalIgnoreCase));
+            System.Drawing.Icon icon = resName is not null
+                ? new System.Drawing.Icon(asm.GetManifestResourceStream(resName)!)
+                : System.Drawing.SystemIcons.Application;
+
+            var menu = new System.Windows.Forms.ContextMenuStrip();
+            menu.Items.Add("Show AudioStreamer", null, (s, e) => ShowFromTray());
+            menu.Items.Add("Exit", null, (s, e) => Close());
+
+            trayIcon = new System.Windows.Forms.NotifyIcon
+            {
+                Icon = icon,
+                Visible = true,
+                Text = "AudioStreamer — Idle",
+                ContextMenuStrip = menu
+            };
+            trayIcon.DoubleClick += (s, e) => ShowFromTray();
+        }
+
+        private void MainWindow_StateChanged(object? sender, System.EventArgs e)
+        {
+            if (WindowState == WindowState.Minimized)
+                Hide();   // remove the taskbar button; the tray icon remains
+        }
+
+        private void ShowFromTray()
+        {
+            Show();
+            WindowState = WindowState.Normal;
+            Activate();
         }
 
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -21,9 +67,16 @@ namespace AudioStreamer
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
             audioStreamerLogic.Stop();
+            trayIcon?.Dispose();
+            trayIcon = null;
         }
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
+        {
+            StartSession(showErrorsAsDialog: true);
+        }
+
+        private void StartSession(bool showErrorsAsDialog)
         {
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
@@ -34,9 +87,24 @@ namespace AudioStreamer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Could not start: {ex.Message}", "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                if (showErrorsAsDialog)
+                    MessageBox.Show($"Could not start: {ex.Message}", "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                else
+                    trayIcon?.ShowBalloonTip(5000, "AudioStreamer", $"Could not start: {ex.Message}", System.Windows.Forms.ToolTipIcon.Warning);
                 SetRunningState(false);
             }
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            if (!audioStreamerLogic.CurrentConfig.StartMinimized)
+                return;
+
+            WindowState = WindowState.Minimized;
+            Hide();   // dock straight to the tray
+            StartSession(showErrorsAsDialog: false);
+            if (audioStreamerLogic.IsRunning)
+                trayIcon?.ShowBalloonTip(3000, "AudioStreamer", "Streaming started.", System.Windows.Forms.ToolTipIcon.Info);
         }
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
@@ -53,6 +121,10 @@ namespace AudioStreamer
             StatusText.Text = running
                 ? $"Running ({audioStreamerLogic.CurrentConfig.Mode}) on port {audioStreamerLogic.CurrentConfig.Port}"
                 : "Idle";
+            if (trayIcon is not null)
+                trayIcon.Text = running
+                    ? $"AudioStreamer — Running ({audioStreamerLogic.CurrentConfig.Mode})"
+                    : "AudioStreamer — Idle";
         }
 
         private static int ParseOr(string text, int fallback) => int.TryParse(text, out int value) ? value : fallback;
@@ -86,6 +158,9 @@ namespace AudioStreamer
             BitsPerSampleTextBox.Text = audioStreamerLogic.CurrentConfig.BitsPerSample.ToString();
             ChannelsTextBox.Text = audioStreamerLogic.CurrentConfig.Channels.ToString();
             StartMinimizedCheckBox.IsChecked = audioStreamerLogic.CurrentConfig.StartMinimized;
+            suppressStartupToggle = true;
+            StartWithWindowsCheckBox.IsChecked = startupService.IsEnabled;
+            suppressStartupToggle = false;
             UpdateModePanels();
         }
 
@@ -93,6 +168,19 @@ namespace AudioStreamer
         {
             UpdateModePanels();
         }
+
+        private void StartWithWindowsCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (suppressStartupToggle)
+                return;
+            if (StartWithWindowsCheckBox.IsChecked == true)
+                startupService.Enable(ExePath());
+            else
+                startupService.Disable();
+        }
+
+        private static string ExePath() =>
+            System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName;
 
         private void UpdateModePanels()
         {

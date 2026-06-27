@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
     <!-- Single source of truth for the app version. The installer reads this back
          from the built exe; build-installer.ps1 -Version can override it at build time. -->
@@ -17,6 +18,10 @@
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\icon.ico" />
   </ItemGroup>
 
 </Project>

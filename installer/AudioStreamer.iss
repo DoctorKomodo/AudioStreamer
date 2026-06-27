@@ -45,6 +45,13 @@ WizardStyle=modern
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Tasks]
+; Final-page checkbox (checked by default). The app's "Start with Windows" toggle
+; manages the same registry value, so it stays in sync after installation.
+Name: "startup"; \
+  Description: "Start {#MyAppName} automatically when Windows starts"; \
+  GroupDescription: "Startup:"
+
 [Files]
 ; Copies everything produced by `dotnet publish` into {app}.
 Source: "..\publish\*"; \
@@ -58,6 +65,17 @@ Name: "{userstartmenu}\{#MyAppName}"; \
   Filename: "{app}\{#MyAppExeName}"; \
   WorkingDir: "{app}"
 Name: "{userstartmenu}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+
+[Registry]
+; Matches exactly what StartupService.Enable() writes, so the app's toggle reads
+; the correct state immediately after the first launch.
+Root: HKCU; \
+  Subkey:    "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; \
+  ValueType: string; \
+  ValueName: "{#MyAppName}"; \
+  ValueData: """{app}\{#MyAppExeName}"""; \
+  Flags:     uninsdeletevalue; \
+  Tasks:     startup
 
 [Run]
 ; Offer to launch the app immediately after installation completes.
