@@ -141,9 +141,23 @@ window (`lost/s`). Verified: 7 unit cases (in-order, swap, loss, wraparound,
 multi-reorder, aged-out-late-arrival, combined) plus a real-code end-to-end
 (reordered stream → `reorder/s` only; lossy stream → `lost/s` only).
 
-**Next (not yet done):** if the field confirms reordering, the real fix is a
-small **sequence-ordered jitter buffer** on the receiver so packets play in order
-(and genuinely-late ones drop cleanly) instead of being appended as they arrive.
+Field result: confirmed reordering — `reorder/s` ticked 1–2 per second with
+`lost/s=0` and a healthy backlog. The reordering is inherent to audio I/O: WASAPI
+delivers samples in periodic buffer-period bursts, the sender ships each burst
+back-to-back with no pacing, and a multi-queue NIC reorders packets sent
+microseconds apart (iperf's even pacing never triggers it).
+
+## 12. Reorder buffer — play in sequence order  **[DONE]**
+
+`ReorderBuffer` sits between the receive socket and the `BufferedWaveProvider`:
+in-order datagrams pass straight through (no copy, no added latency); an early one
+is held until its predecessor arrives; a genuinely missing one is skipped once
+`ReorderWindowPackets` (8 ≈ 40 ms) newer datagrams pile up behind it, so playback
+never stalls indefinitely. Only out-of-order traffic allocates/holds. Verified: 7
+unit cases (in-order, adjacent swap, multi-reorder, true-loss skip, late-arrival
+drop, wraparound in-order, swap across the wrap boundary) all emit correctly
+ordered output, plus a real-code smoke test (audio flows, clean stop). Depth is a
+constant for now — could become a Config/UI knob.
 
 ---
 
@@ -160,7 +174,7 @@ Both ends must run the same version (true of the format header already).
 
 ## Status
 
-All review items (1–9) plus the field-found underrun gap (10) and loss/reorder
-classifier (11) are implemented. Remaining caveat: validation has been
-socket-level and real-code component tests plus the user's own two-machine runs —
-no automated live-audio test.
+All review items (1–9) plus the field-found underrun gap (10), loss/reorder
+classifier (11), and reorder buffer (12) are implemented. Remaining caveat:
+validation has been socket-level and real-code component tests plus the user's own
+two-machine runs — no automated live-audio test.

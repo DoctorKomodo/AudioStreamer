@@ -58,6 +58,10 @@ namespace AudioStreamer
         // Winsock ioctl that stops a UDP socket's Receive from throwing 10054 (WSAECONNRESET) after a prior send
         // drew an ICMP "port unreachable" (e.g. the sender started before the receiver bound the port).
         private const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
+        // How many out-of-order datagrams the receiver holds waiting on a missing one before giving up on it.
+        // ~8 packets ≈ 40 ms at 200 pkt/s: covers any realistic LAN reordering; a genuinely lost packet is
+        // skipped quickly so playback never stalls. Only out-of-order traffic ever touches this path.
+        private const int ReorderWindowPackets = 8;
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
@@ -255,6 +259,16 @@ namespace AudioStreamer
                 byte[] receiveBuffer = new byte[65536];
                 byte[] dropScratch = new byte[16384];   // reused to discard backlog when trimming latency
                 EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+
+                // Feeds the audio buffer in sequence order (NICs can deliver the sender's bursts out of order).
+                // The overflow check lives here because this is where samples actually reach the buffer.
+                var reorderBuffer = new ReorderBuffer(ReorderWindowPackets, (buf, off, cnt) =>
+                {
+                    if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
+                        overflows++;
+                    bufferedWaveProvider.AddSamples(buf, off, cnt);
+                });
+
                 while (!token.IsCancellationRequested)
                 {
                     try
@@ -274,11 +288,9 @@ namespace AudioStreamer
                             // Sequence byte (index 3): classified into true loss vs reordering (late arrival).
                             sequenceTracker.OnReceived(receiveBuffer[3]);
 
-                            // DiscardOnBufferOverflow drops silently; count it so the log surfaces real loss.
-                            if (bufferedWaveProvider.BufferedBytes + payload > bufferedWaveProvider.BufferLength)
-                                overflows++;
-
-                            bufferedWaveProvider.AddSamples(receiveBuffer, HeaderBytes, payload);
+                            // Hand to the reorder buffer, which emits to the audio buffer in sequence order
+                            // (the emit callback counts overflows and calls AddSamples).
+                            reorderBuffer.Add(receiveBuffer[3], receiveBuffer, HeaderBytes, payload);
 
                             // Cap latency: the backlog == current audio-behind-video delay. If clock drift lets it
                             // grow past the target, drop just the excess down to a low-water mark (half the cap)
