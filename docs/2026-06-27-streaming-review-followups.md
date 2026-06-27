@@ -98,11 +98,93 @@ No hand-rolled resampler needed — the OS does the conversion.
 
 ---
 
+## 10. Underruns were invisible (shrinking-direction drift)  **[DONE]**
+
+Field finding: a small audible drop every few minutes with **nothing in the
+log**. Root cause: the drift cap is one-directional — it logs `resync/s` only
+when backlog *grows* (sender clock faster). When the **receiver** clock is
+faster, backlog *drains* to empty and `WasapiOut` plays a brief zero-filled
+silence (the "drop"). That underrun was counted nowhere: `BufferedWaveProvider`
+with ReadFully always returns the full count, so the receive loop never sees the
+shortfall — only the render thread does. Backlog being sampled once/sec also hid
+the sub-second dip to 0.
+
+Fix: `UnderrunCountingWaveProvider` — a transparent pass-through wrapping the
+`BufferedWaveProvider` that `WasapiOut` plays through; it increments an
+`Interlocked` counter when a render `Read` finds `BufferedBytes < count`. Surfaced
+as `underrun/s`, plus `min` backlog (lowest in the interval) as the lead-in
+signal. No added latency/allocation — one comparison + an occasional atomic
+increment per render callback. Verified: a deficit feed reports sustained
+`underrun/s` with `min`≈0; a surplus feed reports 0 after the one expected
+startup blip.
+
+---
+
+## 11. `lost/s` couldn't tell loss from reordering  **[DONE]**
+
+Field finding: the receiver reported a steady `lost/s` of a few per second on a
+*wired* link, with audible glitches worse than Wi-Fi. `iperf3` between the two
+machines proved the network is clean — 0% UDP loss at the audio profile and at
+50 Mbit/s, ~0.08 ms jitter, on a 2.5 GbE link. So the app's "loss" was not on the
+wire.
+
+Root cause of the false count: the old meter counted any forward jump in the
+sequence number as loss, which **packet reordering** also trips (a single swap
+double-counts), and reordering is plausible on a multi-queue 2.5 GbE NIC handling
+the sender's *bursty* datagrams — something `iperf3`'s even pacing never exercises.
+Reordering also causes real glitches because the receiver appends samples in
+arrival order.
+
+Fix: `SequenceLossTracker` unwraps the 1-byte sequence and classifies each gap as
+a **late arrival** (`reorder/s`) or a number that never arrives within a 32-packet
+window (`lost/s`). Verified: 7 unit cases (in-order, swap, loss, wraparound,
+multi-reorder, aged-out-late-arrival, combined) plus a real-code end-to-end
+(reordered stream → `reorder/s` only; lossy stream → `lost/s` only).
+
+Field result: confirmed reordering — `reorder/s` ticked 1–2 per second with
+`lost/s=0` and a healthy backlog. The reordering is inherent to audio I/O: WASAPI
+delivers samples in periodic buffer-period bursts, the sender ships each burst
+back-to-back with no pacing, and a multi-queue NIC reorders packets sent
+microseconds apart (iperf's even pacing never triggers it).
+
+## 12. Reorder buffer — play in sequence order  **[DONE]**
+
+`ReorderBuffer` sits between the receive socket and the `BufferedWaveProvider`:
+in-order datagrams pass straight through (no copy, no added latency); an early one
+is held until its predecessor arrives; a genuinely missing one is skipped once
+`ReorderWindowPackets` (8 ≈ 40 ms) newer datagrams pile up behind it, so playback
+never stalls indefinitely. Only out-of-order traffic allocates/holds. Verified: 7
+unit cases (in-order, adjacent swap, multi-reorder, true-loss skip, late-arrival
+drop, wraparound in-order, swap across the wrap boundary) all emit correctly
+ordered output, plus a real-code smoke test (audio flows, clean stop). Depth is a
+constant for now — could become a Config/UI knob.
+
+Field result: glitches gone (reorders still visible in the log but no longer
+audible). See item 13 for the depth-scaling that followed.
+
+## 13. Scale the reorder window with the data rate  **[DONE]**
+
+Field finding (32-bit samples): `reorder/s` approached the fixed window depth of 8,
+meaning the buffer was on the verge of giving up on packets that were merely late.
+Root cause: sender bursts — and therefore reorder depth measured in *packets* —
+grow with the data rate (bit depth × channels × sample rate), so a fixed 8-packet
+window is too shallow for 32-bit / high-channel / hi-res streams.
+
+Fix: `AudioStreamerLogic.ComputeReorderWindow(format)` =
+`clamp(8 × AverageBytesPerSecond / 192000, 8, 64)`. `AverageBytesPerSecond` is
+`sampleRate × channels × bytes/sample`, so it scales with all three; the give-up
+*time* then stays ~constant (~40 ms) across formats. Verified across 7 formats:
+8 at the 16-bit/48k/stereo baseline, 8 (floored) at 44.1k, 16 at 32-bit/48k/stereo
+and 16-bit/96k, 32 at 96k/32-bit and 16-bit/8ch, clamped to 64 at 192k/32-bit/8ch.
+The chosen window is logged at receiver start (`Reorder window: N packets`).
+
+---
+
 ## Wire protocol (current)
 
 Each UDP datagram: **4-byte header + raw PCM**.
 - bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
-- byte 3: wrapping sequence number (loss meter).
+- byte 3: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
 - byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
 
 Both ends must run the same version (true of the format header already).
@@ -111,7 +193,7 @@ Both ends must run the same version (true of the format header already).
 
 ## Status
 
-All review items (1–9) are now implemented. Remaining caveat: none of this has
-been validated with **live audio through WASAPI on two machines** — only
-socket-level and real-code component tests. A real two-instance listen is still
-the final confidence check.
+All review items (1–9) plus the field-found underrun gap (10), loss/reorder
+classifier (11), reorder buffer (12), and data-rate-scaled reorder window (13) are
+implemented. Remaining caveat: validation has been socket-level and real-code
+component tests plus the user's own two-machine runs — no automated live-audio test.

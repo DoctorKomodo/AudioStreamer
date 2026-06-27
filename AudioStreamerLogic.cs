@@ -22,7 +22,7 @@ namespace AudioStreamer
             public int SenderAudioBufferMillisecondsLength { get; set; } = 100;
             public int ReceiverAudioBufferMillisecondsLength { get; set; } = 1000;
             public int ReceiverAudioLatencyMilliseconds { get; set; } = 20;
-            public int ReceiverMaxLatencyMilliseconds { get; set; } = 400;
+            public int ReceiverMaxLatencyMilliseconds { get; set; } = 150;   // drift cap; trims backlog to half this. 150 keeps lip-sync tight while leaving jitter headroom (400 was too laggy in the field)
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;
             public int Channels { get; set; } = 2;
@@ -58,6 +58,20 @@ namespace AudioStreamer
         // Winsock ioctl that stops a UDP socket's Receive from throwing 10054 (WSAECONNRESET) after a prior send
         // drew an ICMP "port unreachable" (e.g. the sender started before the receiver bound the port).
         private const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
+        // Reorder window: how many out-of-order datagrams the receiver holds waiting on a missing one before
+        // giving up. Sender bursts — and thus reorder depth measured in packets — grow with the data rate, so
+        // the window is scaled by the format's byte rate (AverageBytesPerSecond = sampleRate × channels ×
+        // bytes/sample, covering all three) to keep the give-up *time* roughly constant (~40 ms) across formats;
+        // a fixed count is too shallow for 32-bit / multichannel / hi-res. Base is the 16-bit/48 kHz/stereo
+        // case; capped so a genuinely lost packet can't stall playback too long. (See ComputeReorderWindow.)
+        private const int ReorderBaseWindowPackets = 8;
+        private const int ReorderMaxWindowPackets = 64;
+        private const int ReorderBaselineBytesPerSecond = 48000 * 2 * 2;   // 192000 B/s (16-bit stereo @ 48 kHz)
+
+        /// <summary>Reorder-buffer depth scaled to the stream's byte rate (see the constants above).</summary>
+        public static int ComputeReorderWindow(WaveFormat format) =>
+            Math.Clamp(ReorderBaseWindowPackets * format.AverageBytesPerSecond / ReorderBaselineBytesPerSecond,
+                       ReorderBaseWindowPackets, ReorderMaxWindowPackets);
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
@@ -203,7 +217,7 @@ namespace AudioStreamer
 
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
-                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0));
+                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0, 0));
                         sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                     }
                 }
@@ -243,8 +257,9 @@ namespace AudioStreamer
             long payloadBytes = 0;
             int overflows = 0;
             int resyncs = 0;
-            int lost = 0;
-            int expectedSeq = -1;   // -1 until the first datagram; persists across diagnostics intervals
+            var sequenceTracker = new SequenceLossTracker();   // separates true loss from reordering (persists across intervals)
+            double minBacklogMs = double.MaxValue;   // lowest backlog seen this interval — drains toward 0 before an underrun
+            UnderrunCountingWaveProvider? underrunMeter = null;   // wraps bufferedWaveProvider once the format is known
 
             void ReceiveAudio()
             {
@@ -254,6 +269,18 @@ namespace AudioStreamer
                 byte[] receiveBuffer = new byte[65536];
                 byte[] dropScratch = new byte[16384];   // reused to discard backlog when trimming latency
                 EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+
+                // Feeds the audio buffer in sequence order (NICs can deliver the sender's bursts out of order).
+                // The overflow check lives here because this is where samples actually reach the buffer.
+                int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                LogLine($"Reorder window: {reorderWindow} packets");
+                var reorderBuffer = new ReorderBuffer(reorderWindow, (buf, off, cnt) =>
+                {
+                    if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
+                        overflows++;
+                    bufferedWaveProvider.AddSamples(buf, off, cnt);
+                });
+
                 while (!token.IsCancellationRequested)
                 {
                     try
@@ -265,22 +292,17 @@ namespace AudioStreamer
                             packets++;
                             payloadBytes += payload;
 
-                            // Sequence byte (index 3): count datagrams missing since the previous one. A backward
-                            // jump (reorder or duplicate) isn't counted as loss.
-                            int seq = receiveBuffer[3];
-                            if (expectedSeq >= 0)
-                            {
-                                int gap = (seq - expectedSeq) & 0xFF;
-                                if (gap > 0 && gap < 128)
-                                    lost += gap;
-                            }
-                            expectedSeq = (seq + 1) & 0xFF;
+                            // Sampled before AddSamples — the trough between packets, where the render thread has
+                            // drained the buffer the most. A min trending toward 0 is the lead-in to an underrun.
+                            double backlogNow = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
+                            if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
 
-                            // DiscardOnBufferOverflow drops silently; count it so the log surfaces real loss.
-                            if (bufferedWaveProvider.BufferedBytes + payload > bufferedWaveProvider.BufferLength)
-                                overflows++;
+                            // Sequence byte (index 3): classified into true loss vs reordering (late arrival).
+                            sequenceTracker.OnReceived(receiveBuffer[3]);
 
-                            bufferedWaveProvider.AddSamples(receiveBuffer, HeaderBytes, payload);
+                            // Hand to the reorder buffer, which emits to the audio buffer in sequence order
+                            // (the emit callback counts overflows and calls AddSamples).
+                            reorderBuffer.Add(receiveBuffer[3], receiveBuffer, HeaderBytes, payload);
 
                             // Cap latency: the backlog == current audio-behind-video delay. If clock drift lets it
                             // grow past the target, drop just the excess down to a low-water mark (half the cap)
@@ -303,10 +325,14 @@ namespace AudioStreamer
                         // Periodic diagnostics: backlog is the key drift indicator (steady climb == clock drift).
                         if (logTimer.ElapsedMilliseconds >= 1000)
                         {
+                            double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
+                            var (reorders, losses) = sequenceTracker.Exchange();
                             Report(new DiagnosticsSnapshot(true,
                                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
-                                packets, payloadBytes / 1024, overflows, resyncs, lost));
-                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0; lost = 0;
+                                packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
+                                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
+                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
+                            minBacklogMs = double.MaxValue;
                             logTimer.Restart();
                         }
                     }
@@ -344,7 +370,9 @@ namespace AudioStreamer
                                 BufferDuration = TimeSpan.FromMilliseconds(CurrentConfig.ReceiverAudioBufferMillisecondsLength),
                                 DiscardOnBufferOverflow = true
                             };
-                            output.Init(bufferedWaveProvider);
+                            // Play through the underrun meter so the render thread's starved reads are counted.
+                            underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
+                            output.Init(underrunMeter);
                             output.Play();
                             Task.Run(ReceiveAudio, token);
                             break;
