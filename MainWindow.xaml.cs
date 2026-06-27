@@ -9,14 +9,53 @@ namespace AudioStreamer
     public partial class MainWindow : Window
     {
         private AudioStreamerLogic audioStreamerLogic;
+        private System.Windows.Forms.NotifyIcon? trayIcon;
 
         public MainWindow()
         {
             InitializeComponent();
             audioStreamerLogic = new AudioStreamerLogic();
+            SetupTrayIcon();
             PopulateUIFromConfig();
             this.Closing += Window_Closing;
+            this.StateChanged += MainWindow_StateChanged;
             SetRunningState(false);
+        }
+
+        private void SetupTrayIcon()
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            string? resName = System.Array.Find(asm.GetManifestResourceNames(),
+                n => n.EndsWith("icon.ico", System.StringComparison.OrdinalIgnoreCase));
+            System.Drawing.Icon icon = resName is not null
+                ? new System.Drawing.Icon(asm.GetManifestResourceStream(resName)!)
+                : System.Drawing.SystemIcons.Application;
+
+            var menu = new System.Windows.Forms.ContextMenuStrip();
+            menu.Items.Add("Show AudioStreamer", null, (s, e) => ShowFromTray());
+            menu.Items.Add("Exit", null, (s, e) => Close());
+
+            trayIcon = new System.Windows.Forms.NotifyIcon
+            {
+                Icon = icon,
+                Visible = true,
+                Text = "AudioStreamer — Idle",
+                ContextMenuStrip = menu
+            };
+            trayIcon.DoubleClick += (s, e) => ShowFromTray();
+        }
+
+        private void MainWindow_StateChanged(object? sender, System.EventArgs e)
+        {
+            if (WindowState == WindowState.Minimized)
+                Hide();   // remove the taskbar button; the tray icon remains
+        }
+
+        private void ShowFromTray()
+        {
+            Show();
+            WindowState = WindowState.Normal;
+            Activate();
         }
 
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -24,6 +63,8 @@ namespace AudioStreamer
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
             audioStreamerLogic.Stop();
+            trayIcon?.Dispose();
+            trayIcon = null;
         }
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
@@ -56,6 +97,10 @@ namespace AudioStreamer
             StatusText.Text = running
                 ? $"Running ({audioStreamerLogic.CurrentConfig.Mode}) on port {audioStreamerLogic.CurrentConfig.Port}"
                 : "Idle";
+            if (trayIcon is not null)
+                trayIcon.Text = running
+                    ? $"AudioStreamer — Running ({audioStreamerLogic.CurrentConfig.Mode})"
+                    : "AudioStreamer — Idle";
         }
 
         private static int ParseOr(string text, int fallback) => int.TryParse(text, out int value) ? value : fallback;
