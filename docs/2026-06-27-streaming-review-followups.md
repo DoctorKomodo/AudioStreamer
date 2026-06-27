@@ -206,6 +206,37 @@ in-lock guard is the fix. Validation: build-clean + the user's device-loss field
 
 ---
 
+## 15. Per-callback / per-iteration error logging can flood  **[TODO]**
+
+Found in the streaming review; not yet implemented. Two hot-path `catch` blocks log on
+every failure rather than once:
+- `SenderSession.StartCapture`'s `DataAvailable` handler logs `"Error sending audio: …"`
+  on each failed `Send`. Callbacks fire ~every 10 ms, so a persistent network fault spams
+  ~100 lines/s.
+- `ReceiverSession.ReceiveAudio` (and `InitializeReceiver`) log `"Error receiving audio: …"`
+  on every loop iteration if a non-teardown error recurs.
+
+The `DiagnosticsLog` is async and rotates so it won't block audio, but the churn buries the
+useful first line and wastes the log budget. Fix: a "log once, then suppress until it
+clears" guard — the same `loggedWaiting`-style bool already used by `RestartCapture` /
+`RestartOutput`. Reset the flag after a clean send/receive so a later, distinct fault logs
+again. Low risk, no behaviour change beyond log volume.
+
+## 16. First-packet format is trusted blindly  **[TODO]**
+
+Found in the streaming review; not yet implemented. `ReceiverSession.InitializeReceiver`
+accepts any datagram `>= FormatHeaderBytes` and feeds `WireProtocol.ReadFormatHeader`
+straight into `new WaveFormat(sampleRate, bitDepth, channels)`. A `sampleRate` of 0 (etc.)
+throws, is caught, and the loop keeps waiting, so it self-corrects for *obvious* garbage —
+but a *plausible-looking* stray header from an unrelated app on the same port (e.g. 44/16/2)
+would build a wrong-format pipeline and play noise until restart. Likelihood is low on a
+trusted LAN, which is why it's deferred. Fix: a cheap sanity check before building the
+provider — `sampleRate` in a known set (8/11.025/16/22.05/32/44.1/48/88.2/96/176.4/192 kHz),
+`bitDepth` in {16, 24, 32}, `channels` in 1–8 — and ignore the datagram (keep waiting) if it
+fails. Pairs naturally with item 15's first-packet logging.
+
+---
+
 ## Wire protocol (current)
 
 Each UDP datagram: **4-byte header + raw PCM** (`WireProtocol`).
@@ -221,6 +252,8 @@ Both ends must run the same version (true of the format header already).
 
 All review items (1–9) plus the field-found underrun gap (10), loss/reorder
 classifier (11), reorder buffer (12), data-rate-scaled reorder window (13), and the
-session extraction + receiver output recovery (14) are implemented. Remaining caveat:
-validation has been socket-level and real-code component tests plus the user's own
-two-machine runs — no automated live-audio test.
+session extraction + receiver output recovery (14) are implemented. **Pending [TODO]:**
+log-flood suppression on the hot-path catch blocks (15) and a first-packet format sanity
+check (16) — both from the original streaming review, deferred as low-priority hardening.
+Remaining validation caveat: socket-level and real-code component tests plus the user's
+own two-machine runs — no automated live-audio test.
