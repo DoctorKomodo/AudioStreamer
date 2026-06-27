@@ -22,7 +22,7 @@ namespace AudioStreamer
             public int SenderAudioBufferMillisecondsLength { get; set; } = 100;
             public int ReceiverAudioBufferMillisecondsLength { get; set; } = 1000;
             public int ReceiverAudioLatencyMilliseconds { get; set; } = 20;
-            public int ReceiverMaxLatencyMilliseconds { get; set; } = 400;
+            public int ReceiverMaxLatencyMilliseconds { get; set; } = 150;   // drift cap; trims backlog to half this. 150 keeps lip-sync tight while leaving jitter headroom (400 was too laggy in the field)
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;
             public int Channels { get; set; } = 2;
