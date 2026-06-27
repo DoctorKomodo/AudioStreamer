@@ -159,6 +159,24 @@ drop, wraparound in-order, swap across the wrap boundary) all emit correctly
 ordered output, plus a real-code smoke test (audio flows, clean stop). Depth is a
 constant for now — could become a Config/UI knob.
 
+Field result: glitches gone (reorders still visible in the log but no longer
+audible). See item 13 for the depth-scaling limitation found at 32-bit.
+
+## 13. Reorder window is fixed-depth — too shallow for hi-res formats  **[TODO]**
+
+Field finding (32-bit samples): `reorder/s` approached the window depth of 8,
+meaning the buffer was on the verge of giving up on packets that were merely late.
+Root cause: sender bursts — and therefore reorder depth measured in *packets* —
+grow with the data rate (bit depth × channels × sample rate), so a fixed 8-packet
+window is too shallow for 32-bit / high-channel / hi-res streams (16-bit/48k/stereo
+is fine).
+
+Planned fix: scale `ReorderBuffer`'s window with the negotiated format's byte rate
+so the give-up *time* stays roughly constant (~40 ms) regardless of format —
+e.g. `clamp(8 × AverageBytesPerSecond / 192000, 8, 64)` (8 at the 16-bit/48k/stereo
+baseline, 16 at 32-bit/48k/stereo, capped at 64 so a true loss can't stall too
+long). Optionally expose it as a Config/UI knob too.
+
 ---
 
 ## Wire protocol (current)
@@ -174,7 +192,8 @@ Both ends must run the same version (true of the format header already).
 
 ## Status
 
-All review items (1–9) plus the field-found underrun gap (10), loss/reorder
-classifier (11), and reorder buffer (12) are implemented. Remaining caveat:
+Review items (1–9) plus the field-found underrun gap (10), loss/reorder
+classifier (11), and reorder buffer (12) are implemented. **Open:** item 13 —
+scale the reorder window with the format's byte rate (deferred). Remaining caveat:
 validation has been socket-level and real-code component tests plus the user's own
 two-machine runs — no automated live-audio test.
