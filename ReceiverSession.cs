@@ -1,0 +1,230 @@
+using System.Net;
+using System.Net.Sockets;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
+
+namespace AudioStreamer
+{
+    /// <summary>
+    /// Receiver lifecycle: binds the UDP port, reads the format header from the first datagram, then streams
+    /// incoming PCM through a ReorderBuffer into a BufferedWaveProvider played by WasapiOut. Owns its socket,
+    /// NAudio objects, cancellation, and diagnostics state. Output device-loss recovery lives here (BuildAndPlayOutput).
+    /// </summary>
+    public sealed class ReceiverSession : IStreamSession
+    {
+        private const int ReorderBaseWindowPackets = 8;
+        private const int ReorderMaxWindowPackets = 64;
+        private const int ReorderBaselineBytesPerSecond = 48000 * 2 * 2;   // 192000 B/s (16-bit stereo @ 48 kHz)
+
+        /// <summary>Reorder-buffer depth scaled to the stream's byte rate, keeping give-up time ~constant (~40 ms).</summary>
+        public static int ComputeReorderWindow(WaveFormat format) =>
+            Math.Clamp(ReorderBaseWindowPackets * format.AverageBytesPerSecond / ReorderBaselineBytesPerSecond,
+                       ReorderBaseWindowPackets, ReorderMaxWindowPackets);
+
+        private readonly AudioStreamerLogic.Config config;
+        private readonly Action<string> logLine;
+        private readonly Action<DiagnosticsSnapshot> report;
+
+        // Serializes WasapiOut build / teardown / rebuild (Task 5) against Stop().
+        private readonly object outputLock = new();
+
+        private UdpClient? udpClient;
+        private Socket? socket;
+        private WasapiOut? wasapiOut;
+        private BufferedWaveProvider bufferedWaveProvider = null!;   // built once the first packet reveals the format
+        private UnderrunCountingWaveProvider? underrunMeter;
+        private CancellationTokenSource? cts;
+        private volatile bool isRunning;
+
+        // Diagnostics + latency-cap state, shared across the receive loop iterations (were captured locals).
+        private readonly SequenceLossTracker sequenceTracker = new();
+        private readonly System.Diagnostics.Stopwatch logTimer = new();
+        private int packets, overflows, resyncs;
+        private long payloadBytes;
+        private double minBacklogMs = double.MaxValue;
+        private int maxLatencyMs;
+
+        public ReceiverSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report)
+        {
+            this.config = config;
+            this.logLine = logLine;
+            this.report = report;
+        }
+
+        public bool IsRunning => isRunning;
+
+        public void Start()
+        {
+            maxLatencyMs = config.ReceiverMaxLatencyMilliseconds;
+            var client = new UdpClient(config.Port);
+            client.Client.ReceiveBufferSize = WireProtocol.SocketBufferBytes;
+            client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);
+            socket = client.Client;
+            udpClient = client;
+            cts = new CancellationTokenSource();
+            isRunning = true;
+            logTimer.Restart();
+            Task.Run(InitializeReceiver, cts.Token);
+            logLine("Receiving audio...");
+        }
+
+        public void Stop()
+        {
+            isRunning = false;
+            cts?.Cancel();                 // unblocks ReceiveFrom once the socket closes; loops observe the token
+            lock (outputLock)
+            {
+                var output = wasapiOut;
+                wasapiOut = null;
+                if (output != null)
+                {
+                    // Task 5 will unsubscribe PlaybackStopped here before stopping.
+                    try { output.Stop(); } catch { /* already stopped by the OS */ }
+                    output.Dispose();
+                }
+            }
+            udpClient?.Close();
+            udpClient = null;
+            socket = null;
+            cts?.Dispose();
+            cts = null;
+        }
+
+        // Builds (or rebuilds) WasapiOut around the existing underrun meter and starts playback. Single source of
+        // truth for output creation so the recovery loop (Task 5) reuses it. Flushes to the live edge first so a
+        // rebuild after a device outage resumes at ~0 backlog rather than dumping the piled-up backlog at once.
+        // Constructed here (background thread) so WasapiOut captures no SynchronizationContext and PlaybackStopped
+        // (Task 5) fires off the UI thread.
+        private void BuildAndPlayOutput()
+        {
+            lock (outputLock)
+            {
+                // Re-check isRunning INSIDE the lock so this build is atomic against Stop(), which also takes
+                // outputLock. This is the receiver mirror of the sender's senderLock-atomic IsRunning+StartCapture
+                // pair: without it, a Stop() racing a recovery rebuild (Task 5) could resurrect a live WasapiOut
+                // after the session stopped, leaking a playing device. On the first build (from InitializeReceiver)
+                // isRunning is already true, so this passes.
+                if (!isRunning)
+                    return;
+                bufferedWaveProvider.ClearBuffer();   // no-op on first build (buffer empty); live-edge flush on rebuild
+                var output = new WasapiOut(AudioClientShareMode.Shared, config.ReceiverAudioLatencyMilliseconds);
+                output.Init(underrunMeter);
+                output.Play();
+                wasapiOut = output;
+            }
+        }
+
+        private void InitializeReceiver()
+        {
+            byte[] receiveBuffer = new byte[65536];
+            EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+            var token = cts!.Token;
+            logLine("Waiting for audio connection from sender");
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    int received = socket!.ReceiveFrom(receiveBuffer, ref remoteEP);
+                    if (received >= WireProtocol.FormatHeaderBytes)
+                    {
+                        var (sampleRate, bitDepth, channels) = WireProtocol.ReadFormatHeader(receiveBuffer);
+                        logLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
+                        bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(sampleRate, bitDepth, channels))
+                        {
+                            BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
+                            DiscardOnBufferOverflow = true
+                        };
+                        underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
+                        BuildAndPlayOutput();
+                        Task.Run(ReceiveAudio, token);
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (token.IsCancellationRequested) break;
+                    logLine("Error receiving connection: " + ex.Message);
+                }
+            }
+        }
+
+        private void ReceiveAudio()
+        {
+            byte[] receiveBuffer = new byte[65536];
+            byte[] dropScratch = new byte[16384];
+            EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+            var token = cts!.Token;
+
+            int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+            logLine($"Reorder window: {reorderWindow} packets");
+            var reorderBuffer = new ReorderBuffer(reorderWindow, (buf, off, cnt) =>
+            {
+                if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
+                    overflows++;
+                bufferedWaveProvider.AddSamples(buf, off, cnt);
+            });
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    int received = socket!.ReceiveFrom(receiveBuffer, ref remoteEP);
+                    if (received > WireProtocol.HeaderBytes)
+                    {
+                        int payload = received - WireProtocol.HeaderBytes;
+                        packets++;
+                        payloadBytes += payload;
+
+                        double backlogNow = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
+                        if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
+
+                        sequenceTracker.OnReceived(receiveBuffer[WireProtocol.SequenceByteOffset]);
+                        reorderBuffer.Add(receiveBuffer[WireProtocol.SequenceByteOffset], receiveBuffer, WireProtocol.HeaderBytes, payload);
+                        TrimBacklog(dropScratch);
+                    }
+
+                    if (logTimer.ElapsedMilliseconds >= 1000)
+                        ReportInterval();
+                }
+                catch (Exception ex)
+                {
+                    if (token.IsCancellationRequested) break;
+                    logLine("Error receiving audio: " + ex.Message);
+                }
+            }
+        }
+
+        // Cap latency: backlog == current audio-behind-video delay. If clock drift grows it past the cap, drop just
+        // the excess down to a frame-aligned low-water mark (half the cap) rather than emptying the buffer.
+        private void TrimBacklog(byte[] scratch)
+        {
+            if (maxLatencyMs <= 0 || bufferedWaveProvider.BufferedDuration.TotalMilliseconds <= maxLatencyMs)
+                return;
+            int targetBytes = bufferedWaveProvider.WaveFormat.AverageBytesPerSecond * (maxLatencyMs / 2) / 1000;
+            targetBytes -= targetBytes % bufferedWaveProvider.WaveFormat.BlockAlign;
+            int dropBytes = bufferedWaveProvider.BufferedBytes - targetBytes;
+            while (dropBytes > 0)
+            {
+                int n = bufferedWaveProvider.Read(scratch, 0, Math.Min(dropBytes, scratch.Length));
+                if (n == 0) break;
+                dropBytes -= n;
+            }
+            resyncs++;
+        }
+
+        private void ReportInterval()
+        {
+            double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
+            // MUST NOT SWAP: Exchange() returns (Reorders, Losses) but ForReceiver wants (..., lostPerSec, reorderPerSec, ...).
+            // So the call below passes `losses, reorders` in that order — same as the original (source line 463). Do not "tidy".
+            var (reorders, losses) = sequenceTracker.Exchange();
+            report(DiagnosticsSnapshot.ForReceiver(
+                bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
+                packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
+                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
+            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
+            minBacklogMs = double.MaxValue;
+            logTimer.Restart();
+        }
+    }
+}
