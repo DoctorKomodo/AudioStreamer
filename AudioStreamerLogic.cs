@@ -146,6 +146,9 @@ namespace AudioStreamer
             // Capture local non-null references so the closure and teardown don't depend on the nullable fields.
             var client = new UdpClient();
             client.Client.SendBufferSize = SocketBufferBytes;
+            // On a Connect()ed UDP socket an ICMP "port unreachable" (receiver not up yet) otherwise surfaces as a
+            // 10054 thrown from Send on the capture thread; suppress it the same way the receiver does.
+            client.Client.IOControl(SIO_UDP_CONNRESET, new byte[4], null);
             client.Connect(IPAddress.Parse(CurrentConfig.HostName), CurrentConfig.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
 
@@ -159,6 +162,9 @@ namespace AudioStreamer
             // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
             // frame would shift every subsequent sample (channel swap / noise) until the next resync.
             int blockAlign = capture.WaveFormat.BlockAlign;
+            // Largest whole-frame slice that fits the MTU budget. Guard: if one frame ever exceeded MaxUdpAudioBytes
+            // (hundreds of channels — unreachable for normal PCM), this falls back to one frame per datagram, which
+            // re-allows IP fragmentation but is the only option since a frame can't be split.
             int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
 
             // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
@@ -218,10 +224,6 @@ namespace AudioStreamer
                 DiscardOnBufferOverflow = true
             };
 
-            // Reused for every datagram so the receive thread allocates nothing. Sized to the UDP maximum so an
-            // unexpectedly large datagram can't overflow it (ReceiveFrom throws on truncation otherwise).
-            byte[] receiveBuffer = new byte[65536];
-            EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
             var tokenSource = new CancellationTokenSource();
             cts = tokenSource;
             var token = tokenSource.Token;
@@ -236,6 +238,11 @@ namespace AudioStreamer
 
             void ReceiveAudio()
             {
+                // Each receive loop owns its buffer + remote endpoint so the init and streaming loops never share
+                // mutable state. Sized to the UDP maximum so an oversized datagram can't overflow it (ReceiveFrom
+                // throws on truncation otherwise); reused per datagram to keep the thread allocation-free.
+                byte[] receiveBuffer = new byte[65536];
+                EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
                 while (!token.IsCancellationRequested)
                 {
                     try
@@ -274,7 +281,10 @@ namespace AudioStreamer
                     }
                     catch (Exception ex)
                     {
-                        // Closing the socket in Stop() unblocks Receive() with an exception; the token check exits the loop.
+                        // Stop() cancels the token then closes the socket, unblocking ReceiveFrom with an
+                        // ObjectDisposedException/SocketException — expected teardown, so exit quietly.
+                        if (token.IsCancellationRequested)
+                            break;
                         LogLine("Error receiving audio: " + ex.Message);
                     }
                 }
@@ -282,6 +292,9 @@ namespace AudioStreamer
 
             void InitializeReceiver()
             {
+                // Own buffer + endpoint (see ReceiveAudio); this loop only needs to read the first header packet.
+                byte[] receiveBuffer = new byte[65536];
+                EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
                 LogLine("Waiting for audio connection from sender");
                 while (!token.IsCancellationRequested)
                 {
@@ -308,6 +321,8 @@ namespace AudioStreamer
                     }
                     catch (Exception ex)
                     {
+                        if (token.IsCancellationRequested)
+                            break;
                         LogLine("Error receiving connection: " + ex.Message);
                     }
                 }
