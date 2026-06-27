@@ -56,7 +56,10 @@
         </StackPanel>
 
         <TextBlock x:Name="StatusText" Text="Idle" Margin="1,6"/>
-        <TextBlock x:Name="DiagnosticsText" Foreground="Gray" FontSize="11" Margin="1,0,1,4"/>
+        <!-- Capped to the field width and wrapped so the multi-line diagnostics readout
+             (ToCompactLine) can't widen the SizeToContent window past the input fields. -->
+        <TextBlock x:Name="DiagnosticsText" Foreground="Gray" FontSize="11" Margin="1,0,1,4"
+                   MaxWidth="200" TextWrapping="Wrap" HorizontalAlignment="Left"/>
 
         <StackPanel Orientation="Horizontal" Margin="1">
             <Button x:Name="StartButton" Content="Start" Width="100" Margin="1" Click="StartButton_Click"/>
