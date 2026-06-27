@@ -52,18 +52,6 @@ namespace AudioStreamer
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
         // --- UDP streaming tunables ---
-        // Every datagram begins with a 3-byte wave-format header (see PackWaveFormat) plus a 1-byte wrapping
-        // sequence number the receiver uses to count lost/reordered packets.
-        private const int HeaderBytes = 4;
-        // Keep each datagram inside a standard 1500-byte Ethernet MTU (minus 20-byte IP + 8-byte UDP + the
-        // header above, with headroom for VPN/PPPoE) so IP never fragments the audio: one lost fragment would
-        // otherwise drop the whole datagram. Audio is sliced on frame boundaries (see StartSender).
-        private const int MaxUdpAudioBytes = 1440;
-        // Roomy socket buffers absorb scheduling jitter and bursts so the kernel doesn't silently drop datagrams.
-        private const int SocketBufferBytes = 1 << 20; // 1 MiB
-        // Winsock ioctl that stops a UDP socket's Receive from throwing 10054 (WSAECONNRESET) after a prior send
-        // drew an ICMP "port unreachable" (e.g. the sender started before the receiver bound the port).
-        private const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
         // Reorder window: how many out-of-order datagrams the receiver holds waiting on a missing one before
         // giving up. Sender bursts — and thus reorder depth measured in packets — grow with the data rate, so
         // the window is scaled by the format's byte rate (AverageBytesPerSecond = sampleRate × channels ×
@@ -170,10 +158,10 @@ namespace AudioStreamer
         {
             // Capture a local non-null reference so the closure and teardown don't depend on the nullable field.
             var client = new UdpClient();
-            client.Client.SendBufferSize = SocketBufferBytes;
+            client.Client.SendBufferSize = WireProtocol.SocketBufferBytes;
             // On a Connect()ed UDP socket an ICMP "port unreachable" (receiver not up yet) otherwise surfaces as a
             // 10054 thrown from Send on the capture thread; suppress it the same way the receiver does.
-            client.Client.IOControl(SIO_UDP_CONNRESET, new byte[4], null);
+            client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);
             client.Connect(IPAddress.Parse(CurrentConfig.HostName), CurrentConfig.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
 
@@ -206,14 +194,13 @@ namespace AudioStreamer
                 // Largest whole-frame slice that fits the MTU budget. Guard: if one frame ever exceeded MaxUdpAudioBytes
                 // (hundreds of channels — unreachable for normal PCM), this falls back to one frame per datagram, which
                 // re-allows IP fragmentation but is the only option since a frame can't be split.
-                int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
+                int maxChunk = Math.Max(blockAlign, (WireProtocol.MaxUdpAudioBytes / blockAlign) * blockAlign);
 
                 // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
                 // dropout). The 3-byte format header is constant for the session, so write it once up front; the
                 // sequence byte at index 3 is overwritten per datagram.
-                byte[] sendBuffer = new byte[HeaderBytes + maxChunk];
-                Buffer.BlockCopy(PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels),
-                                 0, sendBuffer, 0, 3);
+                byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + maxChunk];
+                WireProtocol.WriteFormatHeader(sendBuffer, CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels);
 
                 var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
                 int sentPackets = 0;
@@ -232,12 +219,12 @@ namespace AudioStreamer
                         for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
                         {
                             int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
-                            sendBuffer[3] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
-                            Buffer.BlockCopy(e.Buffer, offset, sendBuffer, HeaderBytes, chunk);
-                            socket.Send(sendBuffer, chunk + HeaderBytes);
+                            sendBuffer[WireProtocol.SequenceByteOffset] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
+                            Buffer.BlockCopy(e.Buffer, offset, sendBuffer, WireProtocol.HeaderBytes, chunk);
+                            socket.Send(sendBuffer, chunk + WireProtocol.HeaderBytes);
 
                             sentPackets++;
-                            sentBytes += chunk + HeaderBytes;
+                            sentBytes += chunk + WireProtocol.HeaderBytes;
                         }
 
                         if (sendLogTimer.ElapsedMilliseconds >= 1000)
@@ -368,8 +355,8 @@ namespace AudioStreamer
         {
             // Capture local non-null references so the closures and teardown don't depend on the nullable fields.
             var client = new UdpClient(CurrentConfig.Port);
-            client.Client.ReceiveBufferSize = SocketBufferBytes;
-            client.Client.IOControl(SIO_UDP_CONNRESET, new byte[4], null);   // false => don't surface 10054 on Receive
+            client.Client.ReceiveBufferSize = WireProtocol.SocketBufferBytes;
+            client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);   // false => don't surface 10054 on Receive
             Socket socket = client.Client;
             udpClient = client;
             var output = new WasapiOut(AudioClientShareMode.Shared, CurrentConfig.ReceiverAudioLatencyMilliseconds);
@@ -417,9 +404,9 @@ namespace AudioStreamer
                     try
                     {
                         int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
-                        if (received > HeaderBytes)
+                        if (received > WireProtocol.HeaderBytes)
                         {
-                            int payload = received - HeaderBytes;
+                            int payload = received - WireProtocol.HeaderBytes;
                             packets++;
                             payloadBytes += payload;
 
@@ -429,11 +416,11 @@ namespace AudioStreamer
                             if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
 
                             // Sequence byte (index 3): classified into true loss vs reordering (late arrival).
-                            sequenceTracker.OnReceived(receiveBuffer[3]);
+                            sequenceTracker.OnReceived(receiveBuffer[WireProtocol.SequenceByteOffset]);
 
                             // Hand to the reorder buffer, which emits to the audio buffer in sequence order
                             // (the emit callback counts overflows and calls AddSamples).
-                            reorderBuffer.Add(receiveBuffer[3], receiveBuffer, HeaderBytes, payload);
+                            reorderBuffer.Add(receiveBuffer[WireProtocol.SequenceByteOffset], receiveBuffer, WireProtocol.HeaderBytes, payload);
 
                             // Cap latency: the backlog == current audio-behind-video delay. If clock drift lets it
                             // grow past the target, drop just the excess down to a low-water mark (half the cap)
@@ -489,11 +476,9 @@ namespace AudioStreamer
                     try
                     {
                         int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
-                        if (received >= 3)
+                        if (received >= WireProtocol.FormatHeaderBytes)
                         {
-                            byte[] header = new byte[3];
-                            Buffer.BlockCopy(receiveBuffer, 0, header, 0, 3);
-                            (int sampleRate, int bitDepth, int channels) = UnpackWaveFormat(header);
+                            (int sampleRate, int bitDepth, int channels) = WireProtocol.ReadFormatHeader(receiveBuffer);
                             LogLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
 
                             bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(sampleRate, bitDepth, channels))
@@ -537,22 +522,6 @@ namespace AudioStreamer
             {
                 LogLine("Could not read capture device format: " + ex.Message);
             }
-        }
-
-        private byte[] PackWaveFormat(int sampleRate, int bitDepth, int channels)
-        {
-            byte packedSampleRate = (byte)(sampleRate / 1000);
-            byte packedBitDepth = (byte)bitDepth;
-            byte packedChannels = (byte)channels;
-            return new byte[] { packedSampleRate, packedBitDepth, packedChannels };
-        }
-
-        private (int sampleRate, int bitDepth, int channels) UnpackWaveFormat(byte[] packedData)
-        {
-            int sampleRate = packedData[0] * 1000;
-            int bitDepth = packedData[1];
-            int channels = packedData[2];
-            return (sampleRate, bitDepth, channels);
         }
 
         public class TweakedWasapiLoopbackCapture : WasapiCapture
