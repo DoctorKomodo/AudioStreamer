@@ -9,12 +9,15 @@ namespace AudioStreamer
     public partial class MainWindow : Window
     {
         private AudioStreamerLogic audioStreamerLogic;
+        private StartupService startupService;
+        private bool suppressStartupToggle;
         private System.Windows.Forms.NotifyIcon? trayIcon;
 
         public MainWindow()
         {
             InitializeComponent();
             audioStreamerLogic = new AudioStreamerLogic();
+            startupService = new StartupService();
             SetupTrayIcon();
             PopulateUIFromConfig();
             this.Closing += Window_Closing;
@@ -155,6 +158,9 @@ namespace AudioStreamer
             BitsPerSampleTextBox.Text = audioStreamerLogic.CurrentConfig.BitsPerSample.ToString();
             ChannelsTextBox.Text = audioStreamerLogic.CurrentConfig.Channels.ToString();
             StartMinimizedCheckBox.IsChecked = audioStreamerLogic.CurrentConfig.StartMinimized;
+            suppressStartupToggle = true;
+            StartWithWindowsCheckBox.IsChecked = startupService.IsEnabled;
+            suppressStartupToggle = false;
             UpdateModePanels();
         }
 
@@ -162,6 +168,19 @@ namespace AudioStreamer
         {
             UpdateModePanels();
         }
+
+        private void StartWithWindowsCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (suppressStartupToggle)
+                return;
+            if (StartWithWindowsCheckBox.IsChecked == true)
+                startupService.Enable(ExePath());
+            else
+                startupService.Disable();
+        }
+
+        private static string ExePath() =>
+            System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName;
 
         private void UpdateModePanels()
         {

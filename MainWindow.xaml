@@ -47,7 +47,12 @@
                 <TextBox x:Name="ReceiverMaxLatencyTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
             </StackPanel>
 
+        </StackPanel>
+
+        <StackPanel x:Name="StartupOptionsPanel">
             <CheckBox x:Name="StartMinimizedCheckBox" Content="Start Minimized" Margin="1"/>
+            <CheckBox x:Name="StartWithWindowsCheckBox" Content="Start with Windows" Margin="1"
+                      Checked="StartWithWindowsCheckBox_Changed" Unchecked="StartWithWindowsCheckBox_Changed"/>
         </StackPanel>
 
         <TextBlock x:Name="StatusText" Text="Idle" Margin="1,6"/>
