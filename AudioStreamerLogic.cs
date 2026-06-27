@@ -203,7 +203,7 @@ namespace AudioStreamer
 
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
-                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0));
+                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0, 0));
                         sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                     }
                 }
@@ -243,8 +243,7 @@ namespace AudioStreamer
             long payloadBytes = 0;
             int overflows = 0;
             int resyncs = 0;
-            int lost = 0;
-            int expectedSeq = -1;   // -1 until the first datagram; persists across diagnostics intervals
+            var sequenceTracker = new SequenceLossTracker();   // separates true loss from reordering (persists across intervals)
             double minBacklogMs = double.MaxValue;   // lowest backlog seen this interval — drains toward 0 before an underrun
             UnderrunCountingWaveProvider? underrunMeter = null;   // wraps bufferedWaveProvider once the format is known
 
@@ -272,16 +271,8 @@ namespace AudioStreamer
                             double backlogNow = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
                             if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
 
-                            // Sequence byte (index 3): count datagrams missing since the previous one. A backward
-                            // jump (reorder or duplicate) isn't counted as loss.
-                            int seq = receiveBuffer[3];
-                            if (expectedSeq >= 0)
-                            {
-                                int gap = (seq - expectedSeq) & 0xFF;
-                                if (gap > 0 && gap < 128)
-                                    lost += gap;
-                            }
-                            expectedSeq = (seq + 1) & 0xFF;
+                            // Sequence byte (index 3): classified into true loss vs reordering (late arrival).
+                            sequenceTracker.OnReceived(receiveBuffer[3]);
 
                             // DiscardOnBufferOverflow drops silently; count it so the log surfaces real loss.
                             if (bufferedWaveProvider.BufferedBytes + payload > bufferedWaveProvider.BufferLength)
@@ -311,11 +302,12 @@ namespace AudioStreamer
                         if (logTimer.ElapsedMilliseconds >= 1000)
                         {
                             double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
+                            var (reorders, losses) = sequenceTracker.Exchange();
                             Report(new DiagnosticsSnapshot(true,
                                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
-                                packets, payloadBytes / 1024, overflows, resyncs, lost,
+                                packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
                                 underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
-                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0; lost = 0;
+                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
                             minBacklogMs = double.MaxValue;
                             logTimer.Restart();
                         }

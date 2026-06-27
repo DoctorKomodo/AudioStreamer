@@ -98,17 +98,6 @@ No hand-rolled resampler needed — the OS does the conversion.
 
 ---
 
-## Wire protocol (current)
-
-Each UDP datagram: **4-byte header + raw PCM**.
-- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
-- byte 3: wrapping sequence number (loss meter).
-- byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
-
-Both ends must run the same version (true of the format header already).
-
----
-
 ## 10. Underruns were invisible (shrinking-direction drift)  **[DONE]**
 
 Field finding: a small audible drop every few minutes with **nothing in the
@@ -131,11 +120,38 @@ startup blip.
 
 ---
 
+## 11. `lost/s` couldn't tell loss from reordering  **[DONE]**
+
+Field finding: the receiver reported a steady `lost/s` of a few per second on a
+*wired* link, with audible glitches worse than Wi-Fi. `iperf3` between the two
+machines proved the network is clean — 0% UDP loss at the audio profile and at
+50 Mbit/s, ~0.08 ms jitter, on a 2.5 GbE link. So the app's "loss" was not on the
+wire.
+
+Root cause of the false count: the old meter counted any forward jump in the
+sequence number as loss, which **packet reordering** also trips (a single swap
+double-counts), and reordering is plausible on a multi-queue 2.5 GbE NIC handling
+the sender's *bursty* datagrams — something `iperf3`'s even pacing never exercises.
+Reordering also causes real glitches because the receiver appends samples in
+arrival order.
+
+Fix: `SequenceLossTracker` unwraps the 1-byte sequence and classifies each gap as
+a **late arrival** (`reorder/s`) or a number that never arrives within a 32-packet
+window (`lost/s`). Verified: 7 unit cases (in-order, swap, loss, wraparound,
+multi-reorder, aged-out-late-arrival, combined) plus a real-code end-to-end
+(reordered stream → `reorder/s` only; lossy stream → `lost/s` only).
+
+**Next (not yet done):** if the field confirms reordering, the real fix is a
+small **sequence-ordered jitter buffer** on the receiver so packets play in order
+(and genuinely-late ones drop cleanly) instead of being appended as they arrive.
+
+---
+
 ## Wire protocol (current)
 
 Each UDP datagram: **4-byte header + raw PCM**.
 - bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
-- byte 3: wrapping sequence number (loss meter).
+- byte 3: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
 - byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
 
 Both ends must run the same version (true of the format header already).
@@ -144,6 +160,7 @@ Both ends must run the same version (true of the format header already).
 
 ## Status
 
-All review items (1–9) plus the field-found underrun gap (10) are implemented.
-Remaining caveat: validation has been socket-level and real-code component tests
-plus the user's own two-machine runs — no automated live-audio test.
+All review items (1–9) plus the field-found underrun gap (10) and loss/reorder
+classifier (11) are implemented. Remaining caveat: validation has been
+socket-level and real-code component tests plus the user's own two-machine runs —
+no automated live-audio test.
