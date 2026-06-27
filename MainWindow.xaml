@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:AudioStreamer"
         mc:Ignorable="d"
-        Title="AudioStreamer" SizeToContent="WidthAndHeight" ResizeMode="CanMinimize">
+        Title="AudioStreamer" SizeToContent="WidthAndHeight" ResizeMode="NoResize">
     <StackPanel Margin="6">
         <StackPanel x:Name="SettingsPanel">
 
