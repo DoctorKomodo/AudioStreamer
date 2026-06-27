@@ -45,6 +45,17 @@ namespace AudioStreamer
         // (PascalCase names, Mode as an integer) so existing config files still load unchanged.
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+        // --- UDP streaming tunables ---
+        // Keep each datagram inside a standard 1500-byte Ethernet MTU (minus 20-byte IP + 8-byte UDP + our
+        // 3-byte format header, with headroom for VPN/PPPoE) so IP never fragments the audio: one lost fragment
+        // would otherwise drop the whole datagram. Audio is sliced on frame boundaries (see StartSender).
+        private const int MaxUdpAudioBytes = 1440;
+        // Roomy socket buffers absorb scheduling jitter and bursts so the kernel doesn't silently drop datagrams.
+        private const int SocketBufferBytes = 1 << 20; // 1 MiB
+        // Winsock ioctl that stops a UDP socket's Receive from throwing 10054 (WSAECONNRESET) after a prior send
+        // drew an ICMP "port unreachable" (e.g. the sender started before the receiver bound the port).
+        private const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
+
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
         private void Report(DiagnosticsSnapshot snapshot)
@@ -134,7 +145,8 @@ namespace AudioStreamer
         {
             // Capture local non-null references so the closure and teardown don't depend on the nullable fields.
             var client = new UdpClient();
-            var endPoint = new IPEndPoint(IPAddress.Parse(CurrentConfig.HostName), CurrentConfig.Port);
+            client.Client.SendBufferSize = SocketBufferBytes;
+            client.Connect(IPAddress.Parse(CurrentConfig.HostName), CurrentConfig.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
 
             var capture = new TweakedWasapiLoopbackCapture(CurrentConfig.SenderAudioBufferMillisecondsLength)
@@ -143,7 +155,18 @@ namespace AudioStreamer
             };
             waveSource = capture;
 
-            var audioPropertyHeader = PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels);
+            // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
+            // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
+            // frame would shift every subsequent sample (channel swap / noise) until the next resync.
+            int blockAlign = capture.WaveFormat.BlockAlign;
+            int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
+
+            // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
+            // dropout). The 3-byte format header is constant for the session, so write it once up front.
+            byte[] sendBuffer = new byte[3 + maxChunk];
+            Buffer.BlockCopy(PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels),
+                             0, sendBuffer, 0, 3);
+
             var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
             int sentPackets = 0;
             long sentBytes = 0;
@@ -151,14 +174,16 @@ namespace AudioStreamer
             {
                 try
                 {
-                    byte[] dataWithHeader = new byte[e.BytesRecorded + 3];
-                    Buffer.BlockCopy(audioPropertyHeader, 0, dataWithHeader, 0, 3);
-                    Buffer.BlockCopy(e.Buffer, 0, dataWithHeader, 3, e.BytesRecorded);
+                    for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
+                    {
+                        int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
+                        Buffer.BlockCopy(e.Buffer, offset, sendBuffer, 3, chunk);
+                        client.Send(sendBuffer, chunk + 3);
 
-                    client.Send(dataWithHeader, dataWithHeader.Length, endPoint);
+                        sentPackets++;
+                        sentBytes += chunk + 3;
+                    }
 
-                    sentPackets++;
-                    sentBytes += dataWithHeader.Length;
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
                         Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0));
@@ -181,6 +206,9 @@ namespace AudioStreamer
         {
             // Capture local non-null references so the closures and teardown don't depend on the nullable fields.
             var client = new UdpClient(CurrentConfig.Port);
+            client.Client.ReceiveBufferSize = SocketBufferBytes;
+            client.Client.IOControl(SIO_UDP_CONNRESET, new byte[4], null);   // false => don't surface 10054 on Receive
+            Socket socket = client.Client;
             udpClient = client;
             var output = new WasapiOut(AudioClientShareMode.Shared, CurrentConfig.ReceiverAudioLatencyMilliseconds);
             wasapiOut = output;
@@ -190,7 +218,10 @@ namespace AudioStreamer
                 DiscardOnBufferOverflow = true
             };
 
-            var remoteEP = new IPEndPoint(IPAddress.Any, CurrentConfig.Port);
+            // Reused for every datagram so the receive thread allocates nothing. Sized to the UDP maximum so an
+            // unexpectedly large datagram can't overflow it (ReceiveFrom throws on truncation otherwise).
+            byte[] receiveBuffer = new byte[65536];
+            EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
             var tokenSource = new CancellationTokenSource();
             cts = tokenSource;
             var token = tokenSource.Token;
@@ -209,10 +240,10 @@ namespace AudioStreamer
                 {
                     try
                     {
-                        byte[] receivedBytes = client.Receive(ref remoteEP);
-                        if (receivedBytes.Length > 3)
+                        int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
+                        if (received > 3)
                         {
-                            int payload = receivedBytes.Length - 3;
+                            int payload = received - 3;
                             packets++;
                             payloadBytes += payload;
 
@@ -220,7 +251,7 @@ namespace AudioStreamer
                             if (bufferedWaveProvider.BufferedBytes + payload > bufferedWaveProvider.BufferLength)
                                 overflows++;
 
-                            bufferedWaveProvider.AddSamples(receivedBytes, 3, payload);
+                            bufferedWaveProvider.AddSamples(receiveBuffer, 3, payload);
 
                             // Fix #1 — cap latency. The backlog == current audio-behind-video delay; if clock
                             // drift lets it grow past the target, drop it so lip-sync can't degrade over time.
@@ -256,11 +287,11 @@ namespace AudioStreamer
                 {
                     try
                     {
-                        byte[] receivedBytes = client.Receive(ref remoteEP);
-                        if (receivedBytes.Length >= 3)
+                        int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
+                        if (received >= 3)
                         {
                             byte[] header = new byte[3];
-                            Buffer.BlockCopy(receivedBytes, 0, header, 0, 3);
+                            Buffer.BlockCopy(receiveBuffer, 0, header, 0, 3);
                             (int sampleRate, int bitDepth, int channels) = UnpackWaveFormat(header);
                             LogLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
 
