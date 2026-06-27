@@ -229,7 +229,7 @@ namespace AudioStreamer
 
                         if (sendLogTimer.ElapsedMilliseconds >= 1000)
                         {
-                            Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0, 0));
+                            Report(DiagnosticsSnapshot.ForSender(sentPackets, sentBytes / 1024));
                             sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                         }
                     }
@@ -445,7 +445,7 @@ namespace AudioStreamer
                         {
                             double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
                             var (reorders, losses) = sequenceTracker.Exchange();
-                            Report(new DiagnosticsSnapshot(true,
+                            Report(DiagnosticsSnapshot.ForReceiver(
                                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
                                 packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
                                 underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
