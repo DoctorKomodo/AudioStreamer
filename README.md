@@ -83,3 +83,7 @@ Architecture notes, the wire protocol, and the build/installer details live in *
 ## A note on how this was built
 
 AudioStreamer was developed with the help of AI tools. The code is open for anyone to read, review, and audit.
+
+## License
+
+Released under the [MIT License](LICENSE).
