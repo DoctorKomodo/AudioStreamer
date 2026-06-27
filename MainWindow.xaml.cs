@@ -19,6 +19,7 @@ namespace AudioStreamer
             PopulateUIFromConfig();
             this.Closing += Window_Closing;
             this.StateChanged += MainWindow_StateChanged;
+            this.Loaded += MainWindow_Loaded;
             SetRunningState(false);
         }
 
@@ -69,6 +70,11 @@ namespace AudioStreamer
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
+            StartSession(showErrorsAsDialog: true);
+        }
+
+        private void StartSession(bool showErrorsAsDialog)
+        {
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
             try
@@ -78,9 +84,24 @@ namespace AudioStreamer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Could not start: {ex.Message}", "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                if (showErrorsAsDialog)
+                    MessageBox.Show($"Could not start: {ex.Message}", "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                else
+                    trayIcon?.ShowBalloonTip(5000, "AudioStreamer", $"Could not start: {ex.Message}", System.Windows.Forms.ToolTipIcon.Warning);
                 SetRunningState(false);
             }
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            if (!audioStreamerLogic.CurrentConfig.StartMinimized)
+                return;
+
+            WindowState = WindowState.Minimized;
+            Hide();   // dock straight to the tray
+            StartSession(showErrorsAsDialog: false);
+            if (audioStreamerLogic.IsRunning)
+                trayIcon?.ShowBalloonTip(3000, "AudioStreamer", "Streaming started.", System.Windows.Forms.ToolTipIcon.Info);
         }
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
