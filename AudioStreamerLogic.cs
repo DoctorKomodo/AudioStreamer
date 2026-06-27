@@ -35,7 +35,13 @@ namespace AudioStreamer
         private WasapiCapture? waveSource;
         private WasapiOut? wasapiOut;
 
-        public bool IsRunning { get; private set; }
+        // Serializes the sender capture lifecycle (build / start / stop / auto-rebuild) so the once-per-second
+        // restart loop and a user Stop() can't race on waveSource or leave a live capture running after Stop.
+        private readonly object senderLock = new();
+
+        // volatile so the restart loop on a thread-pool thread reliably observes a Stop() from the UI thread.
+        private volatile bool isRunning;
+        public bool IsRunning => isRunning;
 
         public event Action<DiagnosticsSnapshot>? Diagnostics;
         private readonly DiagnosticsLog diagnosticsLog = new("diagnostics.log");
@@ -101,7 +107,7 @@ namespace AudioStreamer
                 {
                     StartReceiver();
                 }
-                IsRunning = true;
+                isRunning = true;
                 LogLine($"=== session started: {CurrentConfig.Mode} on port {CurrentConfig.Port} ===");
             }
             catch
@@ -114,11 +120,15 @@ namespace AudioStreamer
         public void Stop()
         {
             bool wasRunning = IsRunning;
+            // Clear first so an in-flight capture rebuild bails and a teardown-driven RecordingStopped isn't
+            // mistaken for an unexpected stop (see OnSenderRecordingStopped / RestartSenderCapture). The rebuild
+            // loop's authoritative IsRunning check happens under senderLock, which StopSenderCapture also takes,
+            // so a rebuild either finishes before this teardown (which then disposes it) or observes the cleared
+            // flag and bails — never leaving a live capture running after Stop.
+            isRunning = false;
             cts?.Cancel();
 
-            waveSource?.StopRecording();
-            waveSource?.Dispose();
-            waveSource = null;
+            StopSenderCapture();
 
             wasapiOut?.Stop();
             wasapiOut?.Dispose();
@@ -129,8 +139,6 @@ namespace AudioStreamer
 
             cts?.Dispose();
             cts = null;
-
-            IsRunning = false;
 
             if (wasRunning)
                 LogLine("=== session stopped ===");
@@ -160,7 +168,7 @@ namespace AudioStreamer
 
         private void StartSender()
         {
-            // Capture local non-null references so the closure and teardown don't depend on the nullable fields.
+            // Capture a local non-null reference so the closure and teardown don't depend on the nullable field.
             var client = new UdpClient();
             client.Client.SendBufferSize = SocketBufferBytes;
             // On a Connect()ed UDP socket an ICMP "port unreachable" (receiver not up yet) otherwise surfaces as a
@@ -169,68 +177,191 @@ namespace AudioStreamer
             client.Connect(IPAddress.Parse(CurrentConfig.HostName), CurrentConfig.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
 
-            var capture = new TweakedWasapiLoopbackCapture(CurrentConfig.SenderAudioBufferMillisecondsLength)
+            StartSenderCapture();
+        }
+
+        // Builds the WASAPI loopback capture, wires it to the already-open UDP socket, and starts it. Factored
+        // out of StartSender so it can be re-invoked to transparently rebuild the stream: locking the workstation
+        // or a default-device change invalidates the loopback capture, NAudio ends its capture thread and raises
+        // RecordingStopped, and nothing is captured afterwards until the stream is recreated (which previously
+        // meant a manual Stop/Start from the UI). The new capture re-acquires the current default device.
+        private void StartSenderCapture()
+        {
+            // The whole build+publish runs under senderLock so a concurrent Stop()/rebuild can't interleave with
+            // the StartRecording()→waveSource hand-off. Reentrant when called from RestartSenderCapture (which
+            // already holds the lock); StartRecording only spins up NAudio's capture thread and returns, so the
+            // lock is held briefly.
+            TweakedWasapiLoopbackCapture capture;
+            lock (senderLock)
             {
-                WaveFormat = new WaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels)
-            };
-            waveSource = capture;
+                capture = new TweakedWasapiLoopbackCapture(CurrentConfig.SenderAudioBufferMillisecondsLength)
+                {
+                    WaveFormat = new WaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels)
+                };
 
-            // Log what the device actually captures vs. what we put on the wire. The WASAPI shared-mode engine
-            // converts the device's native mix format (often 32-bit float) to the requested format for us; if a
-            // device ever rejects the requested format, StartRecording throws and this line shows what was asked.
-            LogCaptureFormat(capture.WaveFormat);
+                // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
+                // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
+                // frame would shift every subsequent sample (channel swap / noise) until the next resync.
+                int blockAlign = capture.WaveFormat.BlockAlign;
+                // Largest whole-frame slice that fits the MTU budget. Guard: if one frame ever exceeded MaxUdpAudioBytes
+                // (hundreds of channels — unreachable for normal PCM), this falls back to one frame per datagram, which
+                // re-allows IP fragmentation but is the only option since a frame can't be split.
+                int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
 
-            // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
-            // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
-            // frame would shift every subsequent sample (channel swap / noise) until the next resync.
-            int blockAlign = capture.WaveFormat.BlockAlign;
-            // Largest whole-frame slice that fits the MTU budget. Guard: if one frame ever exceeded MaxUdpAudioBytes
-            // (hundreds of channels — unreachable for normal PCM), this falls back to one frame per datagram, which
-            // re-allows IP fragmentation but is the only option since a frame can't be split.
-            int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
+                // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
+                // dropout). The 3-byte format header is constant for the session, so write it once up front; the
+                // sequence byte at index 3 is overwritten per datagram.
+                byte[] sendBuffer = new byte[HeaderBytes + maxChunk];
+                Buffer.BlockCopy(PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels),
+                                 0, sendBuffer, 0, 3);
 
-            // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
-            // dropout). The 3-byte format header is constant for the session, so write it once up front; the
-            // sequence byte at index 3 is overwritten per datagram.
-            byte[] sendBuffer = new byte[HeaderBytes + maxChunk];
-            Buffer.BlockCopy(PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels),
-                             0, sendBuffer, 0, 3);
+                var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
+                int sentPackets = 0;
+                long sentBytes = 0;
+                // Per-rebuild fresh state: the wrapping sequence restarts at 0 after a recovery, so the receiver
+                // sees one discontinuity at resume — a one-interval blip in its lost/reorder meter, not an audio
+                // bug (the outage was already a real gap). Acceptable; not worth persisting across rebuilds.
+                byte sequence = 0;
+                capture.DataAvailable += (sender, e) =>
+                {
+                    var socket = udpClient;   // read the field each callback so a Stop()/restart can't send on a closed socket
+                    if (socket == null)
+                        return;
+                    try
+                    {
+                        for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
+                        {
+                            int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
+                            sendBuffer[3] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
+                            Buffer.BlockCopy(e.Buffer, offset, sendBuffer, HeaderBytes, chunk);
+                            socket.Send(sendBuffer, chunk + HeaderBytes);
 
-            var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
-            int sentPackets = 0;
-            long sentBytes = 0;
-            byte sequence = 0;
-            capture.DataAvailable += (sender, e) =>
-            {
+                            sentPackets++;
+                            sentBytes += chunk + HeaderBytes;
+                        }
+
+                        if (sendLogTimer.ElapsedMilliseconds >= 1000)
+                        {
+                            Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0, 0));
+                            sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogLine("Error sending audio: " + ex.Message);
+                    }
+                };
+                // Watch for the OS tearing the stream down (lock screen / device change) so we can rebuild it.
+                capture.RecordingStopped += OnSenderRecordingStopped;
+
                 try
                 {
-                    for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
-                    {
-                        int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
-                        sendBuffer[3] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
-                        Buffer.BlockCopy(e.Buffer, offset, sendBuffer, HeaderBytes, chunk);
-                        client.Send(sendBuffer, chunk + HeaderBytes);
-
-                        sentPackets++;
-                        sentBytes += chunk + HeaderBytes;
-                    }
-
-                    if (sendLogTimer.ElapsedMilliseconds >= 1000)
-                    {
-                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0, 0));
-                        sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
-                    }
+                    // NAudio raises DataAvailable on its own capture thread, so this returns immediately.
+                    capture.StartRecording();
                 }
-                catch (Exception ex)
+                catch
                 {
-                    LogLine("Error sending audio: " + ex.Message);
+                    // Nothing started — unwire and dispose so a failed (re)build leaks no unmanaged AudioClient
+                    // and leaves waveSource untouched (still null / the previously live capture). The once-per-
+                    // second retry would otherwise strand a dead capture every second the device is absent.
+                    capture.RecordingStopped -= OnSenderRecordingStopped;
+                    capture.Dispose();
+                    throw;
                 }
-            };
 
-            // NAudio raises DataAvailable on its own capture thread, so this returns immediately.
-            // Teardown happens in Stop().
-            capture.StartRecording();
+                // Publish only after StartRecording succeeds, so a throw above can never leave a dead capture in
+                // waveSource. Teardown happens in Stop() / StopSenderCapture().
+                waveSource = capture;
+            }
+
+            // Outside the lock: LogCaptureFormat does COM endpoint enumeration that can briefly block during a
+            // device-change storm; keeping it off senderLock means it can't stall a UI-thread Stop(). The capture
+            // is already published and started, so logging its format here is safe. (Device native mix format is
+            // usually 32-bit float; the WASAPI shared-mode engine converts it to the requested format for us.)
+            LogCaptureFormat(capture.WaveFormat);
             LogLine("Streaming system audio to " + CurrentConfig.HostName + "...");
+        }
+
+        private void OnSenderRecordingStopped(object? sender, StoppedEventArgs e)
+        {
+            LogLine(e.Exception is null
+                ? "Sender capture stopped unexpectedly."
+                : "Sender capture stopped: " + e.Exception.Message);
+
+            // An intentional teardown unsubscribes this handler first (see StopSenderCapture), so reaching here
+            // means Windows ended the capture out from under us (lock screen / default-device change).
+            bool restart;
+            lock (senderLock)
+            {
+                if (ReferenceEquals(waveSource, sender))
+                    waveSource = null;
+                restart = IsRunning;
+            }
+
+            // Dispose the dead capture off this callback thread. Rebuilt captures are constructed without a
+            // SynchronizationContext, so this handler runs on NAudio's capture thread; disposing the COM
+            // AudioClient from inside its own stopped-event callback is best avoided.
+            var dead = sender as IDisposable;
+            if (restart)
+                RestartSenderCapture(dead);   // disposes dead, then rebuilds
+            else if (dead != null)
+                Task.Run(() => dead.Dispose());
+        }
+
+        // Rebuild the capture after the OS tore it down, retrying until it succeeds or the session stops. The
+        // default render endpoint can be gone for a long, unbounded time — e.g. an HDMI-monitor audio output that
+        // disappears whenever the monitor enters power-saving — so we can't cap the attempts; we poll until a
+        // usable output device is back (typically when the monitor wakes), then resume. The first failure is
+        // logged and the rest suppressed so a long sleep doesn't flood the log. Runs off the capture thread; the
+        // IsRunning + StartSenderCapture pair runs under senderLock so a concurrent Stop() either tears the
+        // rebuilt capture down or makes this bail — never leaving a live capture after Stop.
+        private void RestartSenderCapture(IDisposable? deadCapture)
+        {
+            Task.Run(async () =>
+            {
+                deadCapture?.Dispose();   // off the RecordingStopped callback thread
+                bool loggedWaiting = false;
+                while (IsRunning)
+                {
+                    await Task.Delay(1000);
+                    try
+                    {
+                        lock (senderLock)
+                        {
+                            if (!IsRunning)
+                                return;
+                            StartSenderCapture();   // reentrant lock; publishes waveSource only on success
+                        }
+                        LogLine("Sender capture restarted.");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!loggedWaiting)
+                        {
+                            LogLine($"Sender capture rebuild failed ({ex.Message}); waiting for an audio output device to become available...");
+                            loggedWaiting = true;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Stop and dispose the capture under senderLock. Unsubscribes RecordingStopped first so this teardown isn't
+        // mistaken for an unexpected stop (which would trigger an auto-restart). Safe to call when no capture is
+        // running (receiver), and idempotent (NAudio's StopRecording/Dispose tolerate being called twice).
+        private void StopSenderCapture()
+        {
+            lock (senderLock)
+            {
+                var capture = waveSource;
+                waveSource = null;
+                if (capture == null)
+                    return;
+                capture.RecordingStopped -= OnSenderRecordingStopped;
+                try { capture.StopRecording(); } catch { /* already stopped by the OS */ }
+                capture.Dispose();
+            }
         }
 
         private void StartReceiver()
