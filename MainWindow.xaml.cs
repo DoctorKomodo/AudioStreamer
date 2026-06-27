@@ -11,6 +11,7 @@ namespace AudioStreamer
         private AudioStreamerLogic audioStreamerLogic;
         private StartupService startupService;
         private bool suppressStartupToggle;
+        private bool reallyExit;   // true only when the user picks Exit from the tray; otherwise X hides to tray
         private System.Windows.Forms.NotifyIcon? trayIcon;
 
         public MainWindow()
@@ -38,7 +39,7 @@ namespace AudioStreamer
 
             var menu = new System.Windows.Forms.ContextMenuStrip();
             menu.Items.Add("Show AudioStreamer", null, (s, e) => ShowFromTray());
-            menu.Items.Add("Exit", null, (s, e) => Close());
+            menu.Items.Add("Exit", null, (s, e) => ExitApp());
 
             trayIcon = new System.Windows.Forms.NotifyIcon
             {
@@ -60,6 +61,12 @@ namespace AudioStreamer
         {
             Show();
             WindowState = WindowState.Normal;
+            // A window first realised while minimized (StartMinimized) comes back from the tray
+            // oversized with an unpainted region, because SizeToContent can't measure a minimized
+            // window. Re-assert it now that the window is Normal and visible (toggle via Manual so
+            // the property actually changes and triggers a fresh measure).
+            SizeToContent = SizeToContent.Manual;
+            SizeToContent = SizeToContent.WidthAndHeight;
             Activate();
         }
 
@@ -68,8 +75,23 @@ namespace AudioStreamer
             Dispatcher.BeginInvoke((Action)(() => DiagnosticsText.Text = snapshot.ToCompactLine()));
         }
 
+        private void ExitApp()
+        {
+            reallyExit = true;
+            Close();
+        }
+
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
+            // The window has no minimize button (NoResize), so the X is the hide-to-tray gesture;
+            // a real quit only comes from the tray Exit menu (which sets reallyExit first).
+            if (!reallyExit)
+            {
+                e.Cancel = true;
+                Hide();
+                return;
+            }
+
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
             audioStreamerLogic.Stop();
