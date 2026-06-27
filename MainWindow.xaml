@@ -56,6 +56,7 @@
         </StackPanel>
 
         <TextBlock x:Name="StatusText" Text="Idle" Margin="1,6"/>
+        <TextBlock x:Name="DiagnosticsText" Foreground="Gray" FontSize="11" Margin="1,0,1,4"/>
 
         <StackPanel Orientation="Horizontal" Margin="1">
             <Button x:Name="StartButton" Content="Start" Width="100" Margin="1" Click="StartButton_Click"/>

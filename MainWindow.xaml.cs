@@ -17,6 +17,7 @@ namespace AudioStreamer
         {
             InitializeComponent();
             audioStreamerLogic = new AudioStreamerLogic();
+            audioStreamerLogic.Diagnostics += OnDiagnostics;
             startupService = new StartupService();
             SetupTrayIcon();
             PopulateUIFromConfig();
@@ -62,11 +63,17 @@ namespace AudioStreamer
             Activate();
         }
 
+        private void OnDiagnostics(DiagnosticsSnapshot snapshot)
+        {
+            Dispatcher.BeginInvoke((Action)(() => DiagnosticsText.Text = snapshot.ToCompactLine()));
+        }
+
         private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
             UpdateConfigFromUI();
             audioStreamerLogic.SaveConfig();
             audioStreamerLogic.Stop();
+            audioStreamerLogic.Diagnostics -= OnDiagnostics;
             trayIcon?.Dispose();
             trayIcon = null;
         }
@@ -125,6 +132,9 @@ namespace AudioStreamer
                 trayIcon.Text = running
                     ? $"AudioStreamer — Running ({audioStreamerLogic.CurrentConfig.Mode})"
                     : "AudioStreamer — Idle";
+            DiagnosticsText.Visibility = running ? Visibility.Visible : Visibility.Collapsed;
+            if (!running)
+                DiagnosticsText.Text = string.Empty;
         }
 
         private static int ParseOr(string text, int fallback) => int.TryParse(text, out int value) ? value : fallback;
