@@ -160,22 +160,23 @@ ordered output, plus a real-code smoke test (audio flows, clean stop). Depth is 
 constant for now — could become a Config/UI knob.
 
 Field result: glitches gone (reorders still visible in the log but no longer
-audible). See item 13 for the depth-scaling limitation found at 32-bit.
+audible). See item 13 for the depth-scaling that followed.
 
-## 13. Reorder window is fixed-depth — too shallow for hi-res formats  **[TODO]**
+## 13. Scale the reorder window with the data rate  **[DONE]**
 
-Field finding (32-bit samples): `reorder/s` approached the window depth of 8,
+Field finding (32-bit samples): `reorder/s` approached the fixed window depth of 8,
 meaning the buffer was on the verge of giving up on packets that were merely late.
 Root cause: sender bursts — and therefore reorder depth measured in *packets* —
 grow with the data rate (bit depth × channels × sample rate), so a fixed 8-packet
-window is too shallow for 32-bit / high-channel / hi-res streams (16-bit/48k/stereo
-is fine).
+window is too shallow for 32-bit / high-channel / hi-res streams.
 
-Planned fix: scale `ReorderBuffer`'s window with the negotiated format's byte rate
-so the give-up *time* stays roughly constant (~40 ms) regardless of format —
-e.g. `clamp(8 × AverageBytesPerSecond / 192000, 8, 64)` (8 at the 16-bit/48k/stereo
-baseline, 16 at 32-bit/48k/stereo, capped at 64 so a true loss can't stall too
-long). Optionally expose it as a Config/UI knob too.
+Fix: `AudioStreamerLogic.ComputeReorderWindow(format)` =
+`clamp(8 × AverageBytesPerSecond / 192000, 8, 64)`. `AverageBytesPerSecond` is
+`sampleRate × channels × bytes/sample`, so it scales with all three; the give-up
+*time* then stays ~constant (~40 ms) across formats. Verified across 7 formats:
+8 at the 16-bit/48k/stereo baseline, 8 (floored) at 44.1k, 16 at 32-bit/48k/stereo
+and 16-bit/96k, 32 at 96k/32-bit and 16-bit/8ch, clamped to 64 at 192k/32-bit/8ch.
+The chosen window is logged at receiver start (`Reorder window: N packets`).
 
 ---
 
@@ -192,8 +193,7 @@ Both ends must run the same version (true of the format header already).
 
 ## Status
 
-Review items (1–9) plus the field-found underrun gap (10), loss/reorder
-classifier (11), and reorder buffer (12) are implemented. **Open:** item 13 —
-scale the reorder window with the format's byte rate (deferred). Remaining caveat:
-validation has been socket-level and real-code component tests plus the user's own
-two-machine runs — no automated live-audio test.
+All review items (1–9) plus the field-found underrun gap (10), loss/reorder
+classifier (11), reorder buffer (12), and data-rate-scaled reorder window (13) are
+implemented. Remaining caveat: validation has been socket-level and real-code
+component tests plus the user's own two-machine runs — no automated live-audio test.

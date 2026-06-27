@@ -58,10 +58,20 @@ namespace AudioStreamer
         // Winsock ioctl that stops a UDP socket's Receive from throwing 10054 (WSAECONNRESET) after a prior send
         // drew an ICMP "port unreachable" (e.g. the sender started before the receiver bound the port).
         private const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
-        // How many out-of-order datagrams the receiver holds waiting on a missing one before giving up on it.
-        // ~8 packets ≈ 40 ms at 200 pkt/s: covers any realistic LAN reordering; a genuinely lost packet is
-        // skipped quickly so playback never stalls. Only out-of-order traffic ever touches this path.
-        private const int ReorderWindowPackets = 8;
+        // Reorder window: how many out-of-order datagrams the receiver holds waiting on a missing one before
+        // giving up. Sender bursts — and thus reorder depth measured in packets — grow with the data rate, so
+        // the window is scaled by the format's byte rate (AverageBytesPerSecond = sampleRate × channels ×
+        // bytes/sample, covering all three) to keep the give-up *time* roughly constant (~40 ms) across formats;
+        // a fixed count is too shallow for 32-bit / multichannel / hi-res. Base is the 16-bit/48 kHz/stereo
+        // case; capped so a genuinely lost packet can't stall playback too long. (See ComputeReorderWindow.)
+        private const int ReorderBaseWindowPackets = 8;
+        private const int ReorderMaxWindowPackets = 64;
+        private const int ReorderBaselineBytesPerSecond = 48000 * 2 * 2;   // 192000 B/s (16-bit stereo @ 48 kHz)
+
+        /// <summary>Reorder-buffer depth scaled to the stream's byte rate (see the constants above).</summary>
+        public static int ComputeReorderWindow(WaveFormat format) =>
+            Math.Clamp(ReorderBaseWindowPackets * format.AverageBytesPerSecond / ReorderBaselineBytesPerSecond,
+                       ReorderBaseWindowPackets, ReorderMaxWindowPackets);
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
@@ -262,7 +272,9 @@ namespace AudioStreamer
 
                 // Feeds the audio buffer in sequence order (NICs can deliver the sender's bursts out of order).
                 // The overflow check lives here because this is where samples actually reach the buffer.
-                var reorderBuffer = new ReorderBuffer(ReorderWindowPackets, (buf, off, cnt) =>
+                int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                LogLine($"Reorder window: {reorderWindow} packets");
+                var reorderBuffer = new ReorderBuffer(reorderWindow, (buf, off, cnt) =>
                 {
                     if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
                         overflows++;
