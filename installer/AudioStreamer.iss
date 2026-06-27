@@ -96,49 +96,7 @@ Filename: "taskkill"; \
 Type: files;     Name: "{app}\config.json"
 Type: dirifempty; Name: "{app}"
 
-[Code]
-// ---------------------------------------------------------------------------
-// .NET 10 Windows Desktop Runtime check
-// ---------------------------------------------------------------------------
-// dotnet writes a subkey per installed version under this path (e.g. "10.0.0").
-const
-  DotNetRegKey =
-    'SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App';
-
-function IsDotNet10Installed(): Boolean;
-var
-  Names: TArrayOfString;
-  I:     Integer;
-begin
-  Result := False;
-  if not RegGetSubkeyNames(HKLM, DotNetRegKey, Names) then Exit;
-  for I := 0 to GetArrayLength(Names) - 1 do
-  begin
-    // Version subkeys start with "10." (e.g. "10.0.0", "10.0.1").
-    if Pos('10.', Names[I]) = 1 then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
-function InitializeSetup(): Boolean;
-begin
-  Result := True;
-  if not IsDotNet10Installed() then
-  begin
-    if MsgBox(
-        '.NET 10 Windows Desktop Runtime is required but does not appear to be installed.'
-        + #13#10#13#10
-        + 'Download it from:'
-        + #13#10
-        + 'https://dotnet.microsoft.com/en-us/download/dotnet/10.0'
-        + #13#10#13#10
-        + 'Install it first, then run this installer again.'
-        + #13#10#13#10
-        + 'Continue installation anyway?',
-        mbConfirmation, MB_YESNO) = IDNO then
-      Result := False;
-  end;
-end;
+; No .NET runtime check here: a 32-bit Inno installer reading HKLM gets redirected to
+; WOW6432Node, where the x64 desktop runtime isn't listed, so the check false-positived on
+; machines that already had it. The framework-dependent apphost shows its own "install .NET"
+; prompt (with a download link) on first launch if the runtime is genuinely missing.
