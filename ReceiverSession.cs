@@ -173,12 +173,16 @@ namespace AudioStreamer
             byte[] receiveBuffer = new byte[65536];
             EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
             var token = cts!.Token;
+            // Capture the socket once: Stop() closes it (to unblock ReceiveFrom) and nulls the field, so reading
+            // the field per-iteration could race to null. The local keeps a stable reference; teardown surfaces as
+            // an ObjectDisposedException/SocketException caught below, where the cancelled token exits the loop.
+            Socket socket = this.socket!;
             logLine("Waiting for audio connection from sender");
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    int received = socket!.ReceiveFrom(receiveBuffer, ref remoteEP);
+                    int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
                     if (received >= WireProtocol.FormatHeaderBytes)
                     {
                         var (sampleRate, bitDepth, channels) = WireProtocol.ReadFormatHeader(receiveBuffer);
@@ -208,6 +212,7 @@ namespace AudioStreamer
             byte[] dropScratch = new byte[16384];
             EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
             var token = cts!.Token;
+            Socket socket = this.socket!;   // captured once; see InitializeReceiver for why (Stop() nulls the field)
 
             int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
             logLine($"Reorder window: {reorderWindow} packets");
@@ -222,7 +227,7 @@ namespace AudioStreamer
             {
                 try
                 {
-                    int received = socket!.ReceiveFrom(receiveBuffer, ref remoteEP);
+                    int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
                     if (received > WireProtocol.HeaderBytes)
                     {
                         int payload = received - WireProtocol.HeaderBytes;

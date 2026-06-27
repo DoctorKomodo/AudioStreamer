@@ -235,6 +235,19 @@ provider — `sampleRate` in a known set (8/11.025/16/22.05/32/44.1/48/88.2/96/1
 `bitDepth` in {16, 24, 32}, `channels` in 1–8 — and ignore the datagram (keep waiting) if it
 fails. Pairs naturally with item 15's first-packet logging.
 
+## 17. Sender `Start()` leaks the `UdpClient` if `IPAddress.Parse` throws  **[TODO]**
+
+Found in the branch review (pre-existing, not a refactor regression). In
+`SenderSession.Start()` the `UdpClient` is created and configured (`SendBufferSize`,
+`SIO_UDP_CONNRESET`), then `client.Connect(IPAddress.Parse(config.HostName), config.Port)`
+is called. `IPAddress.Parse` on a malformed host throws **before** `udpClient = client`, so
+the already-open socket is never closed and the coordinator's failure-path `Stop()` sees a
+null `udpClient`. Currently masked because `MainWindow.StartSession` pre-validates the host
+with `IPAddress.TryParse` before calling `Start()`, so this is only reachable if `Start()` is
+invoked directly with a bad host. Fix: parse the address into a local first
+(`var ip = IPAddress.Parse(...)`) — or wrap the socket setup so a throw disposes `client` —
+and only then `Connect`. Trivial; do it alongside items 15/16.
+
 ---
 
 ## Wire protocol (current)
@@ -253,7 +266,8 @@ Both ends must run the same version (true of the format header already).
 All review items (1–9) plus the field-found underrun gap (10), loss/reorder
 classifier (11), reorder buffer (12), data-rate-scaled reorder window (13), and the
 session extraction + receiver output recovery (14) are implemented. **Pending [TODO]:**
-log-flood suppression on the hot-path catch blocks (15) and a first-packet format sanity
-check (16) — both from the original streaming review, deferred as low-priority hardening.
-Remaining validation caveat: socket-level and real-code component tests plus the user's
-own two-machine runs — no automated live-audio test.
+log-flood suppression on the hot-path catch blocks (15), a first-packet format sanity
+check (16), and the sender `IPAddress.Parse` socket leak (17) — low-priority hardening
+deferred from the streaming review and the branch review. Remaining validation caveat:
+socket-level and real-code component tests plus the user's own two-machine runs — no
+automated live-audio test.
