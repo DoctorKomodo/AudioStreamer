@@ -170,7 +170,7 @@ Root cause: sender bursts — and therefore reorder depth measured in *packets* 
 grow with the data rate (bit depth × channels × sample rate), so a fixed 8-packet
 window is too shallow for 32-bit / high-channel / hi-res streams.
 
-Fix: `AudioStreamerLogic.ComputeReorderWindow(format)` =
+Fix: `ReceiverSession.ComputeReorderWindow(format)` =
 `clamp(8 × AverageBytesPerSecond / 192000, 8, 64)`. `AverageBytesPerSecond` is
 `sampleRate × channels × bytes/sample`, so it scales with all three; the give-up
 *time* then stays ~constant (~40 ms) across formats. Verified across 7 formats:
@@ -180,10 +180,36 @@ The chosen window is logged at receiver start (`Reorder window: N packets`).
 
 ---
 
+## 14. Session extraction + receiver output device-loss recovery  **[DONE]**
+
+Structural pass (plan: `docs/2026-06-28-session-extraction-and-receiver-recovery-plan.md`).
+`AudioStreamerLogic` is now a thin coordinator; the sender and receiver hot paths
+moved into `SenderSession`/`ReceiverSession` (both `IStreamSession`), and the on-wire
+framing + socket constants into a static `WireProtocol` (`WriteFormatHeader`/
+`ReadFormatHeader`, named `FormatHeaderBytes`/`SequenceByteOffset`/`HeaderBytes`).
+`DiagnosticsSnapshot` gained `ForSender`/`ForReceiver` factories so the per-second
+reports stop being positional 10-arg calls full of literal zeros. All four of those
+sub-changes are behaviour-preserving.
+
+The one behaviour change: the **receiver** now self-heals from render-device loss,
+symmetric to the sender's existing capture recovery (item from the sender work).
+`WasapiOut.PlaybackStopped` → `OnPlaybackStopped` → `RestartOutput()` polls once/sec
+rebuilding via `BuildAndPlayOutput()` until a device returns. Design choice:
+**flush to the live edge** — `BuildAndPlayOutput()` `ClearBuffer()`s before resuming,
+so playback returns at ~0 backlog rather than dumping the outage's worth of audio.
+Correctness: the `isRunning` re-check sits **inside `outputLock`** (which `Stop()`
+also holds), so a Stop racing a recovery rebuild can't resurrect a live `WasapiOut`
+after teardown — the receiver mirror of the sender's `senderLock` discipline. An
+independent Opus review caught that race in the plan before implementation; the
+in-lock guard is the fix. Validation: build-clean + the user's device-loss field test
+(monitor/output sleep on the receiver) — no automated live-audio test.
+
+---
+
 ## Wire protocol (current)
 
-Each UDP datagram: **4-byte header + raw PCM**.
-- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
+Each UDP datagram: **4-byte header + raw PCM** (`WireProtocol`).
+- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`WriteFormatHeader`/`ReadFormatHeader`).
 - byte 3: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
 - byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
 
@@ -194,6 +220,7 @@ Both ends must run the same version (true of the format header already).
 ## Status
 
 All review items (1–9) plus the field-found underrun gap (10), loss/reorder
-classifier (11), reorder buffer (12), and data-rate-scaled reorder window (13) are
-implemented. Remaining caveat: validation has been socket-level and real-code
-component tests plus the user's own two-machine runs — no automated live-audio test.
+classifier (11), reorder buffer (12), data-rate-scaled reorder window (13), and the
+session extraction + receiver output recovery (14) are implemented. Remaining caveat:
+validation has been socket-level and real-code component tests plus the user's own
+two-machine runs — no automated live-audio test.
