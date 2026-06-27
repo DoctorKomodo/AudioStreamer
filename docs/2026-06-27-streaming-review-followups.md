@@ -55,47 +55,63 @@ overhead. (Folded into the sender rework.)
 
 ---
 
-## 6. Drift cap does a full `ClearBuffer()` — audible dropout  **[TODO]**
+## 6. Drift cap did a full `ClearBuffer()` — audible dropout  **[DONE]**
 
-When backlog exceeds `ReceiverMaxLatencyMilliseconds`, the receiver dumps the
+When backlog exceeded `ReceiverMaxLatencyMilliseconds` the receiver dumped the
 **entire** jitter buffer — a hard discontinuity (click + brief silence) every
-time drift accumulates. Smoother: trim only the excess down to a low-water mark
-(read-and-discard N bytes to reach, say, half the cap) instead of emptying
-everything. A true fix is adaptive resampling, but that's a much larger change
-and overkill for a LAN tool.
+time drift accumulated. Now it trims only the excess down to a frame-aligned
+low-water mark (half the cap) by read-and-discarding from the buffer, so playback
+stays continuous. (Adaptive resampling would be the textbook fix but is overkill
+for a LAN tool.)
 
-## 7. No network-loss visibility (sequence numbers)  **[TODO]**
+## 7. No network-loss visibility (sequence numbers)  **[DONE]**
 
-The `overflows` counter measures the jitter buffer, not the wire. A 1-byte
-sequence number per datagram would let the receiver count actually-dropped or
-reordered packets, turning diagnostics into a real loss meter. Cheap and
-informative; also enables detecting reordering (more likely once datagrams are
-small and numerous).
+The `overflows` counter measures the jitter buffer, not the wire. The header now
+carries a 1-byte wrapping sequence number; the receiver counts forward gaps as
+lost datagrams (backward jumps = reorder/dup, not counted) and reports `lost/s`
+in diagnostics (`DiagnosticsSnapshot.LostPerSec`).
 
-## 8. Dead initial `BufferedWaveProvider`  **[TODO / cleanup]**
+## 8. Dead initial `BufferedWaveProvider`  **[DONE]**
 
-The `BufferedWaveProvider` built at the top of `StartReceiver` is always
-replaced in `InitializeReceiver` before playback starts. Can be removed for
-clarity.
-
----
-
-## 9. Format assumption: declared 16-bit vs device mix format  **[VERIFY]**
-
-WASAPI loopback in shared mode captures at the **device mix format**, commonly
-32-bit float, yet the capture is configured as `WaveFormat(SampleRate, 16,
-Channels)` and the header advertises 16-bit. If a machine's mix format isn't
-16-bit PCM, the receiver would interpret float bytes as PCM (loud noise). Works
-on the current dev machine (its device is presumably 16-bit), but it's fragile
-across machines. Robust fix: read the actual `capture.WaveFormat` after init and
-put *that* in the header rather than the config values.
+The throwaway `BufferedWaveProvider` at the top of `StartReceiver` was always
+replaced in `InitializeReceiver` before playback. Removed (the field is now
+`null!` until the first packet reveals the real format).
 
 ---
 
-## Implementation order (from the review)
+## 9. Format assumption: declared 16-bit vs device mix format  **[DONE]**
 
-1. **MTU chunking + buffer reuse** (items 1, 2, 5) — biggest reliability + latency win.  ← this branch
-2. **`SIO_UDP_CONNRESET` ioctl** (item 3).  ← this branch
-3. **Socket-buffer sizing** (item 4).  ← this branch
-4. Partial-trim drift cap (item 6).  ← follow-up
-5. Sequence numbers / loss meter (item 7), dead-object cleanup (item 8), format hardening (item 9).  ← follow-up
+Investigation (dev machine: Arctis Nova Elite) showed the device mix format is
+`IeeeFloat 32-bit 48kHz 2ch`, but the WASAPI **shared-mode engine already
+converts** it to whatever PCM format the capture requests — forcing 16-bit PCM,
+and even a non-native 44.1kHz, both succeed and capture correctly. So the app was
+already converting to the *configured* format (not hardcoded 16-bit) via the OS;
+the "receiver plays noise" risk only materialises if a device *rejects* the
+requested format, in which case `StartRecording` throws (graceful start failure,
+not noise). Changes made:
+- **Log** the device-native vs wire format at sender start (`LogCaptureFormat`),
+  so a rejected-format machine is diagnosable from the log.
+- Add `AutoConvertPcm | SrcDefaultQuality` capture stream flags to make the
+  shared-mode conversion explicit and cover older/edge devices.
+
+No hand-rolled resampler needed — the OS does the conversion.
+
+---
+
+## Wire protocol (current)
+
+Each UDP datagram: **4-byte header + raw PCM**.
+- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
+- byte 3: wrapping sequence number (loss meter).
+- byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
+
+Both ends must run the same version (true of the format header already).
+
+---
+
+## Status
+
+All review items (1–9) are now implemented. Remaining caveat: none of this has
+been validated with **live audio through WASAPI on two machines** — only
+socket-level and real-code component tests. A real two-instance listen is still
+the final confidence check.

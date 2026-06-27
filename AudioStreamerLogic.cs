@@ -46,9 +46,12 @@ namespace AudioStreamer
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
         // --- UDP streaming tunables ---
-        // Keep each datagram inside a standard 1500-byte Ethernet MTU (minus 20-byte IP + 8-byte UDP + our
-        // 3-byte format header, with headroom for VPN/PPPoE) so IP never fragments the audio: one lost fragment
-        // would otherwise drop the whole datagram. Audio is sliced on frame boundaries (see StartSender).
+        // Every datagram begins with a 3-byte wave-format header (see PackWaveFormat) plus a 1-byte wrapping
+        // sequence number the receiver uses to count lost/reordered packets.
+        private const int HeaderBytes = 4;
+        // Keep each datagram inside a standard 1500-byte Ethernet MTU (minus 20-byte IP + 8-byte UDP + the
+        // header above, with headroom for VPN/PPPoE) so IP never fragments the audio: one lost fragment would
+        // otherwise drop the whole datagram. Audio is sliced on frame boundaries (see StartSender).
         private const int MaxUdpAudioBytes = 1440;
         // Roomy socket buffers absorb scheduling jitter and bursts so the kernel doesn't silently drop datagrams.
         private const int SocketBufferBytes = 1 << 20; // 1 MiB
@@ -158,6 +161,11 @@ namespace AudioStreamer
             };
             waveSource = capture;
 
+            // Log what the device actually captures vs. what we put on the wire. The WASAPI shared-mode engine
+            // converts the device's native mix format (often 32-bit float) to the requested format for us; if a
+            // device ever rejects the requested format, StartRecording throws and this line shows what was asked.
+            LogCaptureFormat(capture.WaveFormat);
+
             // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
             // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
             // frame would shift every subsequent sample (channel swap / noise) until the next resync.
@@ -168,14 +176,16 @@ namespace AudioStreamer
             int maxChunk = Math.Max(blockAlign, (MaxUdpAudioBytes / blockAlign) * blockAlign);
 
             // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
-            // dropout). The 3-byte format header is constant for the session, so write it once up front.
-            byte[] sendBuffer = new byte[3 + maxChunk];
+            // dropout). The 3-byte format header is constant for the session, so write it once up front; the
+            // sequence byte at index 3 is overwritten per datagram.
+            byte[] sendBuffer = new byte[HeaderBytes + maxChunk];
             Buffer.BlockCopy(PackWaveFormat(CurrentConfig.SampleRate, CurrentConfig.BitsPerSample, CurrentConfig.Channels),
                              0, sendBuffer, 0, 3);
 
             var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
             int sentPackets = 0;
             long sentBytes = 0;
+            byte sequence = 0;
             capture.DataAvailable += (sender, e) =>
             {
                 try
@@ -183,16 +193,17 @@ namespace AudioStreamer
                     for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
                     {
                         int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
-                        Buffer.BlockCopy(e.Buffer, offset, sendBuffer, 3, chunk);
-                        client.Send(sendBuffer, chunk + 3);
+                        sendBuffer[3] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
+                        Buffer.BlockCopy(e.Buffer, offset, sendBuffer, HeaderBytes, chunk);
+                        client.Send(sendBuffer, chunk + HeaderBytes);
 
                         sentPackets++;
-                        sentBytes += chunk + 3;
+                        sentBytes += chunk + HeaderBytes;
                     }
 
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
-                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0));
+                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0));
                         sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                     }
                 }
@@ -218,11 +229,8 @@ namespace AudioStreamer
             udpClient = client;
             var output = new WasapiOut(AudioClientShareMode.Shared, CurrentConfig.ReceiverAudioLatencyMilliseconds);
             wasapiOut = output;
-            var bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
-            {
-                BufferDuration = TimeSpan.FromMilliseconds(CurrentConfig.ReceiverAudioBufferMillisecondsLength),
-                DiscardOnBufferOverflow = true
-            };
+            // Built for real once the first packet reveals the sender's format (see InitializeReceiver).
+            BufferedWaveProvider bufferedWaveProvider = null!;
 
             var tokenSource = new CancellationTokenSource();
             cts = tokenSource;
@@ -235,6 +243,8 @@ namespace AudioStreamer
             long payloadBytes = 0;
             int overflows = 0;
             int resyncs = 0;
+            int lost = 0;
+            int expectedSeq = -1;   // -1 until the first datagram; persists across diagnostics intervals
 
             void ReceiveAudio()
             {
@@ -242,29 +252,50 @@ namespace AudioStreamer
                 // mutable state. Sized to the UDP maximum so an oversized datagram can't overflow it (ReceiveFrom
                 // throws on truncation otherwise); reused per datagram to keep the thread allocation-free.
                 byte[] receiveBuffer = new byte[65536];
+                byte[] dropScratch = new byte[16384];   // reused to discard backlog when trimming latency
                 EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
                 while (!token.IsCancellationRequested)
                 {
                     try
                     {
                         int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
-                        if (received > 3)
+                        if (received > HeaderBytes)
                         {
-                            int payload = received - 3;
+                            int payload = received - HeaderBytes;
                             packets++;
                             payloadBytes += payload;
+
+                            // Sequence byte (index 3): count datagrams missing since the previous one. A backward
+                            // jump (reorder or duplicate) isn't counted as loss.
+                            int seq = receiveBuffer[3];
+                            if (expectedSeq >= 0)
+                            {
+                                int gap = (seq - expectedSeq) & 0xFF;
+                                if (gap > 0 && gap < 128)
+                                    lost += gap;
+                            }
+                            expectedSeq = (seq + 1) & 0xFF;
 
                             // DiscardOnBufferOverflow drops silently; count it so the log surfaces real loss.
                             if (bufferedWaveProvider.BufferedBytes + payload > bufferedWaveProvider.BufferLength)
                                 overflows++;
 
-                            bufferedWaveProvider.AddSamples(receiveBuffer, 3, payload);
+                            bufferedWaveProvider.AddSamples(receiveBuffer, HeaderBytes, payload);
 
-                            // Fix #1 — cap latency. The backlog == current audio-behind-video delay; if clock
-                            // drift lets it grow past the target, drop it so lip-sync can't degrade over time.
+                            // Cap latency: the backlog == current audio-behind-video delay. If clock drift lets it
+                            // grow past the target, drop just the excess down to a low-water mark (half the cap)
+                            // rather than emptying the buffer — a full ClearBuffer would click and briefly go silent.
                             if (maxLatencyMs > 0 && bufferedWaveProvider.BufferedDuration.TotalMilliseconds > maxLatencyMs)
                             {
-                                bufferedWaveProvider.ClearBuffer();
+                                int targetBytes = bufferedWaveProvider.WaveFormat.AverageBytesPerSecond * (maxLatencyMs / 2) / 1000;
+                                targetBytes -= targetBytes % bufferedWaveProvider.WaveFormat.BlockAlign;   // frame-aligned low-water mark
+                                int dropBytes = bufferedWaveProvider.BufferedBytes - targetBytes;
+                                while (dropBytes > 0)
+                                {
+                                    int n = bufferedWaveProvider.Read(dropScratch, 0, Math.Min(dropBytes, dropScratch.Length));
+                                    if (n == 0) break;
+                                    dropBytes -= n;
+                                }
                                 resyncs++;
                             }
                         }
@@ -274,8 +305,8 @@ namespace AudioStreamer
                         {
                             Report(new DiagnosticsSnapshot(true,
                                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
-                                packets, payloadBytes / 1024, overflows, resyncs));
-                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
+                                packets, payloadBytes / 1024, overflows, resyncs, lost));
+                            packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0; lost = 0;
                             logTimer.Restart();
                         }
                     }
@@ -333,6 +364,22 @@ namespace AudioStreamer
             LogLine("Receiving audio...");
         }
 
+        private void LogCaptureFormat(WaveFormat wireFormat)
+        {
+            try
+            {
+                using var devices = new MMDeviceEnumerator();
+                var device = devices.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                var mix = device.AudioClient.MixFormat;
+                LogLine($"Capture '{device.FriendlyName}': device native {mix.Encoding} {mix.SampleRate}Hz {mix.BitsPerSample}bit {mix.Channels}ch; "
+                      + $"sending {wireFormat.Encoding} {wireFormat.SampleRate}Hz {wireFormat.BitsPerSample}bit {wireFormat.Channels}ch");
+            }
+            catch (Exception ex)
+            {
+                LogLine("Could not read capture device format: " + ex.Message);
+            }
+        }
+
         private byte[] PackWaveFormat(int sampleRate, int bitDepth, int channels)
         {
             byte packedSampleRate = (byte)(sampleRate / 1000);
@@ -369,7 +416,13 @@ namespace AudioStreamer
 
             protected override AudioClientStreamFlags GetAudioClientStreamFlags()
             {
-                return AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
+                // AutoConvertPcm + SrcDefaultQuality let the shared-mode engine resample/convert the device's
+                // native mix format to whatever PCM format we request (rate, bit depth, channels). Modern Windows
+                // does this even without the flags, but they make it explicit and cover older/edge devices.
+                return AudioClientStreamFlags.Loopback
+                     | AudioClientStreamFlags.AutoConvertPcm
+                     | AudioClientStreamFlags.SrcDefaultQuality
+                     | base.GetAudioClientStreamFlags();
             }
         }
     }
