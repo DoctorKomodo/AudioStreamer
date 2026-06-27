@@ -37,6 +37,17 @@ namespace AudioStreamer
 
         public bool IsRunning { get; private set; }
 
+        public event Action<DiagnosticsSnapshot>? Diagnostics;
+        private readonly DiagnosticsLog diagnosticsLog = new("diagnostics.log");
+
+        private void LogLine(string line) => diagnosticsLog.Log(line);
+
+        private void Report(DiagnosticsSnapshot snapshot)
+        {
+            LogLine(snapshot.ToLogLine());
+            Diagnostics?.Invoke(snapshot);
+        }
+
         public AudioStreamerLogic()
         {
             LoadConfig();
@@ -58,6 +69,7 @@ namespace AudioStreamer
                     StartReceiver();
                 }
                 IsRunning = true;
+                LogLine($"=== session started: {CurrentConfig.Mode} on port {CurrentConfig.Port} ===");
             }
             catch
             {
@@ -68,6 +80,7 @@ namespace AudioStreamer
 
         public void Stop()
         {
+            bool wasRunning = IsRunning;
             cts?.Cancel();
 
             waveSource?.StopRecording();
@@ -85,6 +98,9 @@ namespace AudioStreamer
             cts = null;
 
             IsRunning = false;
+
+            if (wasRunning)
+                LogLine("=== session stopped ===");
         }
 
         private void LoadConfig()
@@ -140,20 +156,20 @@ namespace AudioStreamer
                     sentBytes += dataWithHeader.Length;
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
-                        Console.WriteLine($"[send] pkts/s={sentPackets} KB/s={sentBytes / 1024}");
+                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0));
                         sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("Error sending audio: " + ex.Message);
+                    LogLine("Error sending audio: " + ex.Message);
                 }
             };
 
             // NAudio raises DataAvailable on its own capture thread, so this returns immediately.
             // Teardown happens in Stop().
             capture.StartRecording();
-            Console.WriteLine("Streaming system audio to " + CurrentConfig.HostName + "...");
+            LogLine("Streaming system audio to " + CurrentConfig.HostName + "...");
         }
 
         private void StartReceiver()
@@ -213,9 +229,9 @@ namespace AudioStreamer
                         // Periodic diagnostics: backlog is the key drift indicator (steady climb == clock drift).
                         if (logTimer.ElapsedMilliseconds >= 1000)
                         {
-                            Console.WriteLine(
-                                $"[recv] backlog={bufferedWaveProvider.BufferedDuration.TotalMilliseconds:F0}ms " +
-                                $"pkts/s={packets} KB/s={payloadBytes / 1024} overflow/s={overflows} resync/s={resyncs}");
+                            Report(new DiagnosticsSnapshot(true,
+                                bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
+                                packets, payloadBytes / 1024, overflows, resyncs));
                             packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
                             logTimer.Restart();
                         }
@@ -223,14 +239,14 @@ namespace AudioStreamer
                     catch (Exception ex)
                     {
                         // Closing the socket in Stop() unblocks Receive() with an exception; the token check exits the loop.
-                        Console.WriteLine("Error receiving audio: " + ex.Message);
+                        LogLine("Error receiving audio: " + ex.Message);
                     }
                 }
             }
 
             void InitializeReceiver()
             {
-                Console.WriteLine("Waiting for audio connection from sender");
+                LogLine("Waiting for audio connection from sender");
                 while (!token.IsCancellationRequested)
                 {
                     try
@@ -241,7 +257,7 @@ namespace AudioStreamer
                             byte[] header = new byte[3];
                             Buffer.BlockCopy(receivedBytes, 0, header, 0, 3);
                             (int sampleRate, int bitDepth, int channels) = UnpackWaveFormat(header);
-                            Console.WriteLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
+                            LogLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
 
                             bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(sampleRate, bitDepth, channels))
                             {
@@ -256,14 +272,14 @@ namespace AudioStreamer
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine("Error receiving connection: " + ex.Message);
+                        LogLine("Error receiving connection: " + ex.Message);
                     }
                 }
             }
 
             // Runs on a background thread; this returns immediately and teardown happens in Stop().
             Task.Run(InitializeReceiver, token);
-            Console.WriteLine("Receiving audio...");
+            LogLine("Receiving audio...");
         }
 
         private byte[] PackWaveFormat(int sampleRate, int bitDepth, int channels)
