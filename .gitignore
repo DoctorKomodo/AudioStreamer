@@ -9,6 +9,10 @@ installer/Output/
 ## Runtime-generated config (the app writes this next to the executable)
 config.json
 
+## Runtime-generated diagnostics log (written next to the executable)
+diagnostics.log
+diagnostics.1.log
+
 ## Visual Studio / user-specific
 .vs/
 *.user
