@@ -1,0 +1,60 @@
+<Window x:Class="AudioStreamer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:AudioStreamer"
+        mc:Ignorable="d"
+        Title="AudioStreamer" SizeToContent="WidthAndHeight" ResizeMode="CanMinimize">
+    <StackPanel Margin="6">
+        <StackPanel x:Name="SettingsPanel">
+
+            <TextBlock Text="Mode (Sender/Receiver)" Margin="1"/>
+            <ComboBox x:Name="ModeComboBox" Width="200" Margin="1" HorizontalAlignment="Left"
+                      SelectionChanged="ModeComboBox_SelectionChanged">
+                <ComboBoxItem Content="Sender"/>
+                <ComboBoxItem Content="Receiver"/>
+            </ComboBox>
+
+            <TextBlock Text="Port" Margin="1"/>
+            <TextBox x:Name="PortTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+            <StackPanel x:Name="SenderPanel">
+                <TextBlock Text="Host Name" Margin="1"/>
+                <TextBox x:Name="HostNameTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Sender Audio Buffer (ms)" Margin="1"/>
+                <TextBox x:Name="SenderAudioBufferTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Sample Rate" Margin="1"/>
+                <TextBox x:Name="SampleRateTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Bits Per Sample" Margin="1"/>
+                <TextBox x:Name="BitsPerSampleTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Channels" Margin="1"/>
+                <TextBox x:Name="ChannelsTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+            </StackPanel>
+
+            <StackPanel x:Name="ReceiverPanel">
+                <TextBlock Text="Receiver Audio Buffer (ms)" Margin="1"/>
+                <TextBox x:Name="ReceiverAudioBufferTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Receiver Audio Latency (ms)" Margin="1"/>
+                <TextBox x:Name="ReceiverAudioLatencyTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Receiver Max Latency (ms)" Margin="1"/>
+                <TextBox x:Name="ReceiverMaxLatencyTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+            </StackPanel>
+
+            <CheckBox x:Name="StartMinimizedCheckBox" Content="Start Minimized" Margin="1"/>
+        </StackPanel>
+
+        <TextBlock x:Name="StatusText" Text="Idle" Margin="1,6"/>
+
+        <StackPanel Orientation="Horizontal" Margin="1">
+            <Button x:Name="StartButton" Content="Start" Width="100" Margin="1" Click="StartButton_Click"/>
+            <Button x:Name="StopButton" Content="Stop" Width="100" Margin="1" Click="StopButton_Click"/>
+        </StackPanel>
+    </StackPanel>
+</Window>

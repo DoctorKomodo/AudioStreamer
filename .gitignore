@@ -1,0 +1,18 @@
+## .NET build output
+[Bb]in/
+[Oo]bj/
+
+## Publish / installer build output
+publish/
+installer/Output/
+
+## Runtime-generated config (the app writes this next to the executable)
+config.json
+
+## Visual Studio / user-specific
+.vs/
+*.user
+
+## OS cruft
+Thumbs.db
+.DS_Store

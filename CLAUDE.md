@@ -1,0 +1,60 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+AudioStreamer is a Windows-only WPF desktop app (.NET 10, `net10.0-windows`, single project) that streams system audio between two machines over UDP on a LAN. One instance runs as a **Sender** (captures the local system audio output and transmits it); another runs as a **Receiver** (plays the incoming stream). The role is chosen at runtime via the `Mode` setting.
+
+Originally created in Visual Studio; it builds and debugs entirely from the `dotnet` CLI / VS Code (see `.vscode/`). Requires the .NET 10 Windows Desktop runtime.
+
+## Commands
+
+```powershell
+dotnet build                 # Debug build
+dotnet build -c Release      # Release build
+dotnet run                   # build + launch the WPF app
+```
+
+There is no test project. In VS Code, `Ctrl+Shift+B` runs the `build` task and `F5` builds then launches via `.vscode/launch.json` (which points at `bin/Debug/net10.0-windows/AudioStreamer.dll`).
+
+### Installer
+
+```powershell
+.\build-installer.ps1                 # publish + compile installer
+.\build-installer.ps1 -Version 1.2.3  # override the version for this build
+```
+
+`build-installer.ps1` cleans `.\publish\`, runs `dotnet publish -c Release` (framework-dependent), then compiles `installer\AudioStreamer.iss` with **Inno Setup 6** (`ISCC.exe`, found under Program Files) into `installer\Output\AudioStreamer-Setup.exe`. Prereqs: .NET 10 SDK + Inno Setup 6.
+
+Key installer design points:
+- **Per-user install** to `%LOCALAPPDATA%\AudioStreamer` (`PrivilegesRequired=lowest`, no UAC). That location is writable, so the app's `config.json` (written next to the exe) works; the shortcut sets `WorkingDir={app}` and the uninstaller deletes `config.json`.
+- **Framework-dependent** publish, so the target machine needs the .NET 10 Windows Desktop Runtime — `[Code]` `InitializeSetup` warns (HKLM `Microsoft.WindowsDesktop.App` ≥ `10.`) if it's missing. (Switch to self-contained by adding `--self-contained -r win-x64` in the publish step and dropping the check.)
+- **Version** flows from the csproj `<Version>` → published exe → read at compile time by the `.iss` via `GetVersionNumbersString`, so all three stay in sync.
+- No "start with Windows" / tray integration (AudioStreamer is a plain windowed app). `AppPublisher`/`MyAppURL` in the `.iss` are **TODO placeholders** — set them before distributing.
+- `Resources\icon.ico` is the app/installer icon (`<ApplicationIcon>` in the csproj, `SetupIconFile` in the `.iss`).
+
+## Architecture
+
+- **`MainWindow.xaml` / `MainWindow.xaml.cs`** — the only window; a vertical `StackPanel` of labelled TextBoxes, each mapping to a `Config` field. `UpdateConfigFromUI()` / `PopulateUIFromConfig()` sync the UI to `AudioStreamerLogic.CurrentConfig` (`UpdateConfigFromUI` uses `ParseOr` so a blank/invalid field keeps the existing config value instead of throwing). The window uses `SizeToContent="WidthAndHeight"` (no fixed `Width`/`Height`) so it auto-fits its content — fields are fixed-width (200) and the window grows to fit, so adding/renaming fields won't clip. It is also **mode-aware**: `ModeComboBox_SelectionChanged` → `UpdateModePanels()` collapses `SenderPanel` (Host Name, Sender Audio Buffer, Sample Rate, Bits Per Sample, Channels) in Receiver mode and `ReceiverPanel` (the three receiver buffer/latency fields) in Sender mode — Port/Mode/Start Minimized are common. Collapsed fields keep their text, so toggling modes is non-destructive. Receiver mode hides the format fields because the receiver derives the format from the packet header, not config.
+
+- **`AudioStreamerLogic.cs`** — all the real logic, UI-independent:
+  - `Config` (nested class) is the full settings model, persisted as `config.json` **next to the executable** (working directory at runtime, e.g. `bin/Debug/.../config.json`). `LoadConfig()` runs in the constructor; on any read/parse failure it writes a fresh default file via `SaveConfig()`. `SaveConfig()` serializes `CurrentConfig` back to disk (Newtonsoft.Json). Note `LoadConfig()` only ever *adds* missing fields on a parse failure — an existing valid file that lacks a newly-added `Config` field is not rewritten, so the in-memory default is used until the file is next saved (or deleted to regenerate).
+  - `Start()` branches on `Config.Mode` (`Sender`/`Receiver`) into `StartSender()` or `StartReceiver()`.
+  - **Sender**: `TweakedWasapiLoopbackCapture` (a `WasapiCapture` subclass that sets the `Loopback` stream flag) captures the default render device, then UDP-sends each buffer to `HostName:Port`.
+  - **Receiver**: binds a `UdpClient` on `Port`, feeds incoming packets into a NAudio `BufferedWaveProvider` played through `WasapiOut`. It first waits for a packet to read the format header, then (re)builds the buffer/output for that format before streaming.
+  - **Latency cap (drift control)**: the receiver's audio backlog (`BufferedWaveProvider.BufferedDuration`) *is* the current audio-behind-video delay. Because the sender and receiver run on independent sound-card clocks, that backlog drifts upward over time. After each `AddSamples`, the receive loop drops the buffer (`ClearBuffer()`) if the backlog exceeds `Config.ReceiverMaxLatencyMilliseconds` (default 400; set ≤0 to disable). `ReceiverAudioBufferMillisecondsLength` (default 1000) is only the overflow ceiling/jitter headroom and must stay comfortably above the cap. The receive loop and the sender's `DataAvailable` handler emit once-per-second `[recv]`/`[send]` diagnostics (backlog, pkts/s, KB/s, overflow/s, resync/s) — a steadily climbing `backlog` is the signature of clock drift.
+
+- **Wire protocol**: every UDP packet is a **3-byte header + raw PCM audio**. The header packs the wave format — `PackWaveFormat` stores `sampleRate/1000`, `bitDepth`, `channels` as one byte each; `UnpackWaveFormat` reverses it (sampleRate × 1000). Both sides must agree on this layout.
+
+## Start/Stop lifecycle
+
+`Start()` is non-blocking: the sender's capture runs on NAudio's own `DataAvailable` thread and the receiver runs via `Task.Run`, so both return immediately to the UI thread. The session objects (`udpClient`, `waveSource`, `wasapiOut`, `cts`) are nullable fields assigned when a session starts and torn down in `Stop()` (cancel token → stop/dispose capture and output → close socket → null everything out so a fresh Start works). Closing the socket in `Stop()` is what unblocks the receiver's blocking `UdpClient.Receive`; the cancellation-token check then exits the loop.
+
+`Start()` guards on `IsRunning` (a no-op if already running, preventing a double-start that would crash the receiver on a port-in-use bind), and wraps the launch in try/catch: on failure it calls `Stop()` to clean up the partial session and rethrows. Synchronous failure points (receiver port-in-use, sender `IPAddress.Parse` on a bad Host Name, `StartRecording` with no audio device) throw before any background task starts, so they surface to the caller. `StartButton_Click` catches that and shows a `MessageBox` rather than crashing.
+
+UI state is driven by `SetRunningState(bool)`: Start disabled / Stop enabled / `SettingsPanel` locked / status line set while running, and the inverse when idle. Persistence happens on Start (`UpdateConfigFromUI` → `SaveConfig`) and on window close (`Window_Closing` → `UpdateConfigFromUI` → `SaveConfig` → `Stop`). A *background-thread* session failure (e.g. audio device removed mid-stream) is not surfaced — the UI keeps showing "Running".
+
+Do **not** reintroduce `Console.ReadKey` keep-alive loops here — an earlier version of this code used them, but with no console attached they throw `InvalidOperationException` and would block the UI thread. The remaining `Console.WriteLine` calls are harmless diagnostics (visible when run via `dotnet run`, which attaches a console).
+
+- Nullable reference types are enabled. The session fields are guarded with `?.` throughout; this is intentional, not a bug to "fix" by force-initializing them.
