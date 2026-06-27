@@ -1,9 +1,9 @@
 ﻿using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
-using Newtonsoft.Json;
 
 namespace AudioStreamer
 {
@@ -39,6 +39,11 @@ namespace AudioStreamer
 
         public event Action<DiagnosticsSnapshot>? Diagnostics;
         private readonly DiagnosticsLog diagnosticsLog = new("diagnostics.log");
+
+        // Cached because System.Text.Json recommends reusing options instances. Indented to keep
+        // config.json hand-editable; default enum/property handling matches the old Newtonsoft output
+        // (PascalCase names, Mode as an integer) so existing config files still load unchanged.
+        private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
@@ -110,7 +115,7 @@ namespace AudioStreamer
                 string configText = File.ReadAllText("config.json");
                 if (!string.IsNullOrEmpty(configText))
                 {
-                    CurrentConfig = JsonConvert.DeserializeObject<Config>(configText) ?? new Config();
+                    CurrentConfig = JsonSerializer.Deserialize<Config>(configText) ?? new Config();
                 }
             }
             catch
@@ -122,7 +127,7 @@ namespace AudioStreamer
 
         public void SaveConfig()
         {
-            File.WriteAllText("config.json", JsonConvert.SerializeObject(CurrentConfig, Newtonsoft.Json.Formatting.Indented));
+            File.WriteAllText("config.json", JsonSerializer.Serialize(CurrentConfig, JsonOptions));
         }
 
         private void StartSender()
