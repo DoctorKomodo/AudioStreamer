@@ -13,9 +13,8 @@
 ; single source of truth. Requires ..\publish\AudioStreamer.exe to exist first —
 ; build-installer.ps1 runs `dotnet publish` before invoking ISCC.
 #define MyAppVersion   GetVersionNumbersString(AddBackslash(SourcePath) + "..\publish\AudioStreamer.exe")
-; TODO: set these to your real publisher name and project URL.
-#define MyAppPublisher "AudioStreamer"
-#define MyAppURL       ""
+#define MyAppPublisher "DoctorKomodo"
+#define MyAppURL       "https://github.com/DoctorKomodo/AudioStreamer"
 #define MyAppExeName   "AudioStreamer.exe"
 
 [Setup]
@@ -25,6 +24,9 @@ AppId={{F9D28724-EEF6-40FF-99DA-B04F7D743854}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}
 
 ; Install to %LOCALAPPDATA%\AudioStreamer — no UAC prompt required.
 DefaultDirName={localappdata}\{#MyAppName}
