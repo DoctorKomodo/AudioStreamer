@@ -78,7 +78,7 @@ namespace AudioStreamer
                 wasapiOut = null;
                 if (output != null)
                 {
-                    // Task 5 will unsubscribe PlaybackStopped here before stopping.
+                    output.PlaybackStopped -= OnPlaybackStopped;
                     try { output.Stop(); } catch { /* already stopped by the OS */ }
                     output.Dispose();
                 }
@@ -109,9 +109,63 @@ namespace AudioStreamer
                 bufferedWaveProvider.ClearBuffer();   // no-op on first build (buffer empty); live-edge flush on rebuild
                 var output = new WasapiOut(AudioClientShareMode.Shared, config.ReceiverAudioLatencyMilliseconds);
                 output.Init(underrunMeter);
+                output.PlaybackStopped += OnPlaybackStopped;
                 output.Play();
                 wasapiOut = output;
             }
+        }
+
+        private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+        {
+            logLine(e.Exception is null
+                ? "Receiver output stopped unexpectedly."
+                : "Receiver output stopped: " + e.Exception.Message);
+
+            bool restart;
+            lock (outputLock)
+            {
+                if (ReferenceEquals(wasapiOut, sender))
+                    wasapiOut = null;
+                restart = isRunning;
+            }
+
+            var dead = sender as IDisposable;
+            if (restart)
+                RestartOutput(dead);     // disposes dead, then rebuilds on a poll
+            else if (dead != null)
+                Task.Run(() => dead.Dispose());
+        }
+
+        // Rebuild WasapiOut after the OS tore the render device down (e.g. the receiver's monitor entered
+        // power-saving), retrying until it succeeds or the session stops. Unbounded like the sender's capture
+        // recovery. BuildAndPlayOutput ClearBuffer()s first, so playback resumes at the live edge.
+        private void RestartOutput(IDisposable? deadOutput)
+        {
+            var token = cts?.Token ?? CancellationToken.None;
+            Task.Run(async () =>
+            {
+                deadOutput?.Dispose();   // off the PlaybackStopped callback thread
+                bool loggedWaiting = false;
+                while (isRunning && !token.IsCancellationRequested)
+                {
+                    await Task.Delay(1000);
+                    try
+                    {
+                        if (!isRunning || token.IsCancellationRequested) return;
+                        BuildAndPlayOutput();
+                        logLine("Receiver output restarted.");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!loggedWaiting)
+                        {
+                            logLine($"Receiver output rebuild failed ({ex.Message}); waiting for an audio output device to become available...");
+                            loggedWaiting = true;
+                        }
+                    }
+                }
+            });
         }
 
         private void InitializeReceiver()
