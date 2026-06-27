@@ -1,5 +1,8 @@
 ﻿using System.Windows;
 using System.Windows.Controls;
+// UseWindowsForms adds a global using for System.Windows.Forms, which makes
+// MessageBox ambiguous; pin it to the WPF one.
+using MessageBox = System.Windows.MessageBox;
 
 namespace AudioStreamer
 {
