@@ -203,7 +203,7 @@ namespace AudioStreamer
 
                     if (sendLogTimer.ElapsedMilliseconds >= 1000)
                     {
-                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0));
+                        Report(new DiagnosticsSnapshot(false, 0, sentPackets, sentBytes / 1024, 0, 0, 0, 0, 0));
                         sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                     }
                 }
@@ -245,6 +245,8 @@ namespace AudioStreamer
             int resyncs = 0;
             int lost = 0;
             int expectedSeq = -1;   // -1 until the first datagram; persists across diagnostics intervals
+            double minBacklogMs = double.MaxValue;   // lowest backlog seen this interval — drains toward 0 before an underrun
+            UnderrunCountingWaveProvider? underrunMeter = null;   // wraps bufferedWaveProvider once the format is known
 
             void ReceiveAudio()
             {
@@ -264,6 +266,11 @@ namespace AudioStreamer
                             int payload = received - HeaderBytes;
                             packets++;
                             payloadBytes += payload;
+
+                            // Sampled before AddSamples — the trough between packets, where the render thread has
+                            // drained the buffer the most. A min trending toward 0 is the lead-in to an underrun.
+                            double backlogNow = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
+                            if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
 
                             // Sequence byte (index 3): count datagrams missing since the previous one. A backward
                             // jump (reorder or duplicate) isn't counted as loss.
@@ -303,10 +310,13 @@ namespace AudioStreamer
                         // Periodic diagnostics: backlog is the key drift indicator (steady climb == clock drift).
                         if (logTimer.ElapsedMilliseconds >= 1000)
                         {
+                            double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
                             Report(new DiagnosticsSnapshot(true,
                                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
-                                packets, payloadBytes / 1024, overflows, resyncs, lost));
+                                packets, payloadBytes / 1024, overflows, resyncs, lost,
+                                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
                             packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0; lost = 0;
+                            minBacklogMs = double.MaxValue;
                             logTimer.Restart();
                         }
                     }
@@ -344,7 +354,9 @@ namespace AudioStreamer
                                 BufferDuration = TimeSpan.FromMilliseconds(CurrentConfig.ReceiverAudioBufferMillisecondsLength),
                                 DiscardOnBufferOverflow = true
                             };
-                            output.Init(bufferedWaveProvider);
+                            // Play through the underrun meter so the render thread's starved reads are counted.
+                            underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
+                            output.Init(underrunMeter);
                             output.Play();
                             Task.Run(ReceiveAudio, token);
                             break;

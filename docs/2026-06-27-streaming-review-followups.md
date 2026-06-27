@@ -109,9 +109,41 @@ Both ends must run the same version (true of the format header already).
 
 ---
 
+## 10. Underruns were invisible (shrinking-direction drift)  **[DONE]**
+
+Field finding: a small audible drop every few minutes with **nothing in the
+log**. Root cause: the drift cap is one-directional — it logs `resync/s` only
+when backlog *grows* (sender clock faster). When the **receiver** clock is
+faster, backlog *drains* to empty and `WasapiOut` plays a brief zero-filled
+silence (the "drop"). That underrun was counted nowhere: `BufferedWaveProvider`
+with ReadFully always returns the full count, so the receive loop never sees the
+shortfall — only the render thread does. Backlog being sampled once/sec also hid
+the sub-second dip to 0.
+
+Fix: `UnderrunCountingWaveProvider` — a transparent pass-through wrapping the
+`BufferedWaveProvider` that `WasapiOut` plays through; it increments an
+`Interlocked` counter when a render `Read` finds `BufferedBytes < count`. Surfaced
+as `underrun/s`, plus `min` backlog (lowest in the interval) as the lead-in
+signal. No added latency/allocation — one comparison + an occasional atomic
+increment per render callback. Verified: a deficit feed reports sustained
+`underrun/s` with `min`≈0; a surplus feed reports 0 after the one expected
+startup blip.
+
+---
+
+## Wire protocol (current)
+
+Each UDP datagram: **4-byte header + raw PCM**.
+- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`PackWaveFormat`).
+- byte 3: wrapping sequence number (loss meter).
+- byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
+
+Both ends must run the same version (true of the format header already).
+
+---
+
 ## Status
 
-All review items (1–9) are now implemented. Remaining caveat: none of this has
-been validated with **live audio through WASAPI on two machines** — only
-socket-level and real-code component tests. A real two-instance listen is still
-the final confidence check.
+All review items (1–9) plus the field-found underrun gap (10) are implemented.
+Remaining caveat: validation has been socket-level and real-code component tests
+plus the user's own two-machine runs — no automated live-audio test.
