@@ -27,13 +27,13 @@
                 <TextBox x:Name="SenderAudioBufferTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
 
                 <TextBlock Text="Sample Rate" Margin="1"/>
-                <TextBox x:Name="SampleRateTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+                <ComboBox x:Name="SampleRateCombo" Width="200" Margin="1" HorizontalAlignment="Left"/>
 
                 <TextBlock Text="Bits Per Sample" Margin="1"/>
-                <TextBox x:Name="BitsPerSampleTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+                <ComboBox x:Name="BitDepthCombo" Width="200" Margin="1" HorizontalAlignment="Left"/>
 
                 <TextBlock Text="Channels" Margin="1"/>
-                <TextBox x:Name="ChannelsTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+                <ComboBox x:Name="ChannelsCombo" Width="200" Margin="1" HorizontalAlignment="Left"/>
             </StackPanel>
 
             <StackPanel x:Name="ReceiverPanel">
