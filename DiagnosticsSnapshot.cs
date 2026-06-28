@@ -13,6 +13,14 @@ namespace AudioStreamer
         int UnderrunPerSec,
         double MinBacklogMs)
     {
+        /// <summary>Factory for a sender snapshot (no receiver-side metrics).</summary>
+        public static DiagnosticsSnapshot ForSender(int packetsPerSec, long kbPerSec) =>
+            new(false, 0, packetsPerSec, kbPerSec, 0, 0, 0, 0, 0, 0);
+
+        /// <summary>Factory for a receiver snapshot.</summary>
+        public static DiagnosticsSnapshot ForReceiver(double backlogMs, int packetsPerSec, long kbPerSec, int overflowPerSec, int resyncPerSec, int lostPerSec, int reorderPerSec, int underrunPerSec, double minBacklogMs) =>
+            new(true, backlogMs, packetsPerSec, kbPerSec, overflowPerSec, resyncPerSec, lostPerSec, reorderPerSec, underrunPerSec, minBacklogMs);
+
         /// <summary>Detailed line for the log file / console.</summary>
         public string ToLogLine() => IsReceiver
             ? $"[recv] backlog={BacklogMs:F0}ms min={MinBacklogMs:F0}ms pkts/s={PacketsPerSec} KB/s={KbPerSec} lost/s={LostPerSec} reorder/s={ReorderPerSec} underrun/s={UnderrunPerSec} overflow/s={OverflowPerSec} resync/s={ResyncPerSec}"
