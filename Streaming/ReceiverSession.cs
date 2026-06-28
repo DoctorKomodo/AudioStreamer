@@ -177,6 +177,7 @@ namespace AudioStreamer
             // the field per-iteration could race to null. The local keeps a stable reference; teardown surfaces as
             // an ObjectDisposedException/SocketException caught below, where the cancelled token exits the loop.
             Socket socket = this.socket!;
+            bool loggedBadFormat = false;
             logLine("Waiting for audio connection from sender");
             while (!token.IsCancellationRequested)
             {
@@ -185,9 +186,20 @@ namespace AudioStreamer
                     int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
                     if (received >= WireProtocol.FormatHeaderBytes)
                     {
-                        var (sampleRate, bitDepth, channels) = WireProtocol.ReadFormatHeader(receiveBuffer);
-                        logLine($"Sample rate: {sampleRate}, Bit depth: {bitDepth}, Channels: {channels} received from sender");
-                        bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(sampleRate, bitDepth, channels))
+                        byte code = WireProtocol.ReadFormatCode(receiveBuffer);
+                        if (AudioFormats.FromCode(code) is not { } fmt)
+                        {
+                            // Unknown code: a foreign datagram on the port, or a version mismatch. Ignore it and
+                            // keep waiting (log once so a stream of them doesn't flood the log). [followups item 16]
+                            if (!loggedBadFormat)
+                            {
+                                logLine($"Ignoring datagram with unknown format code {code} (sender/receiver version mismatch?).");
+                                loggedBadFormat = true;
+                            }
+                            continue;
+                        }
+                        logLine($"Sample rate: {fmt.SampleRate}, Bit depth: {fmt.BitDepth}, Channels: {fmt.Channels} received from sender");
+                        bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
                         {
                             BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
                             DiscardOnBufferOverflow = true
