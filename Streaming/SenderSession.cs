@@ -64,6 +64,12 @@ namespace AudioStreamer
         // meant a manual Stop/Start from the UI). The new capture re-acquires the current default device.
         private void StartCapture()
         {
+            // Acquire the render endpoint once, before senderLock (lock-free on the first-start path; under the
+            // caller's lock on the RestartCapture path — accepted). MixFormat.Channels is what Auto matches.
+            var renderInfo = TryGetDefaultRenderInfo();
+            int nativeChannels = renderInfo?.Mix.Channels ?? AudioFormats.DefaultChannels;
+            int channels = AudioFormats.ResolveCaptureChannels(config.Channels, nativeChannels);
+
             // The whole build+publish runs under senderLock so a concurrent Stop()/rebuild can't interleave with
             // the StartRecording()→waveSource hand-off. Reentrant when called from RestartCapture (which
             // already holds the lock); StartRecording only spins up NAudio's capture thread and returns, so the
@@ -73,7 +79,7 @@ namespace AudioStreamer
             {
                 capture = new TweakedWasapiLoopbackCapture(config.SenderAudioBufferMillisecondsLength)
                 {
-                    WaveFormat = AudioFormats.ToWaveFormat(config.SampleRate, config.BitsPerSample, config.Channels)
+                    WaveFormat = AudioFormats.ToWaveFormat(config.SampleRate, config.BitsPerSample, channels)
                 };
 
                 // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
@@ -89,7 +95,7 @@ namespace AudioStreamer
                 // dropout). The 1-byte format code is constant for the session, so write it once up front; the
                 // sequence byte at index 1 is overwritten per datagram.
                 byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + maxChunk];
-                WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(config.SampleRate, config.BitsPerSample, config.Channels));
+                WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(config.SampleRate, config.BitsPerSample, channels));
 
                 var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
                 int sentPackets = 0;
@@ -154,7 +160,7 @@ namespace AudioStreamer
             // device-change storm; keeping it off senderLock means it can't stall a UI-thread Stop(). The capture
             // is already published and started, so logging its format here is safe. (Device native mix format is
             // usually 32-bit float; the WASAPI shared-mode engine converts it to the requested format for us.)
-            LogCaptureFormat(capture.WaveFormat);
+            LogCaptureFormat(renderInfo, capture.WaveFormat);
             logLine("Streaming system audio to " + config.HostName + "...");
         }
 
@@ -240,20 +246,35 @@ namespace AudioStreamer
             }
         }
 
-        private void LogCaptureFormat(WaveFormat wireFormat)
+        // Acquires the default render endpoint once: its friendly name and shared-mode mix format. The mix
+        // channel count is what Auto matches (endpoint configuration, not content). Returns null on any
+        // COM/enumeration failure so the caller falls back to a stereo capture rather than throwing.
+        private static (string Name, WaveFormat Mix)? TryGetDefaultRenderInfo()
         {
             try
             {
                 using var devices = new MMDeviceEnumerator();
                 var device = devices.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                var mix = device.AudioClient.MixFormat;
-                logLine($"Capture '{device.FriendlyName}': device native {mix.Encoding} {mix.SampleRate}Hz {mix.BitsPerSample}bit {mix.Channels}ch; "
-                      + $"sending {wireFormat.Encoding} {wireFormat.SampleRate}Hz {wireFormat.BitsPerSample}bit {wireFormat.Channels}ch");
+                return (device.FriendlyName, device.AudioClient.MixFormat);
             }
-            catch (Exception ex)
+            catch
             {
-                logLine("Could not read capture device format: " + ex.Message);
+                return null;
             }
+        }
+
+        private void LogCaptureFormat((string Name, WaveFormat Mix)? renderInfo, WaveFormat wireFormat)
+        {
+            if (renderInfo is not { } info)
+            {
+                logLine($"Sending {wireFormat.Encoding} {wireFormat.SampleRate}Hz {wireFormat.BitsPerSample}bit {wireFormat.Channels}ch "
+                      + "(capture device format unavailable)");
+                return;
+            }
+
+            var mix = info.Mix;
+            logLine($"Capture '{info.Name}': device native {mix.Encoding} {mix.SampleRate}Hz {mix.BitsPerSample}bit {mix.Channels}ch; "
+                  + $"sending {wireFormat.Encoding} {wireFormat.SampleRate}Hz {wireFormat.BitsPerSample}bit {wireFormat.Channels}ch");
         }
 
         public class TweakedWasapiLoopbackCapture : WasapiCapture
