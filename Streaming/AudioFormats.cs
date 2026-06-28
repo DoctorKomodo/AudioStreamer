@@ -54,16 +54,17 @@ namespace AudioStreamer
         public static Format? FromCode(byte code) => code < Formats.Count ? Formats[code] : null;
 
         /// <summary>
-        /// Builds the NAudio WaveFormat for a catalog format. 32-bit maps to IEEE float
-        /// (CreateIeeeFloatWaveFormat) — NAudio's int-args WaveFormat ctor would produce 32-bit *integer*
-        /// PCM, which WASAPI shared mode rejects on typical hardware (its mix format is 32-bit float).
-        /// 16/24-bit are genuine integer PCM. Both ends must build the format the same way, so this is the
-        /// single construction point.
+        /// Builds the NAudio capture/playback WaveFormat for a catalog format — always WAVEFORMATEXTENSIBLE,
+        /// integer PCM. WASAPI shared mode **requires** EXTENSIBLE for &gt;2 channels: a plain WAVEFORMATEX
+        /// multichannel format fails `IAudioClient.Initialize` with E_INVALIDARG ("Value does not fall within the
+        /// expected range"). Extensible-int is accepted across the whole rate×depth×channel matrix on both the
+        /// sender (loopback capture) and receiver (WasapiOut playback) — verified empirically on a 32-bit-float
+        /// stereo device. 32-bit IEEE *float* was tried but the engine's AutoConvertPcm rejects float up-mix past
+        /// 2 channels, so 32-bit uses integer here. Both ends build the format identically from the wire code, so
+        /// the raw PCM round-trips. This is the single format-construction point.
         /// </summary>
         public static WaveFormat ToWaveFormat(int sampleRate, int bitDepth, int channels) =>
-            bitDepth == 32
-                ? WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels)
-                : new WaveFormat(sampleRate, bitDepth, channels);
+            new WaveFormatExtensible(sampleRate, bitDepth, channels);
 
         private static int IndexOf(int sampleRate, int bitDepth, int channels)
         {
