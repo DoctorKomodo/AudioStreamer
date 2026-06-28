@@ -180,7 +180,8 @@ namespace AudioStreamer
         {
             SampleRateCombo.ItemsSource = AudioFormats.SampleRates.Select(r => new FormatOption(r, AudioFormats.RateLabel(r))).ToList();
             BitDepthCombo.ItemsSource   = AudioFormats.BitDepths.Select(b => new FormatOption(b, AudioFormats.DepthLabel(b))).ToList();
-            ChannelsCombo.ItemsSource   = AudioFormats.ChannelCounts.Select(c => new FormatOption(c, AudioFormats.ChannelLabel(c))).ToList();
+            ChannelsCombo.ItemsSource   = new[] { new FormatOption(AudioFormats.AutoChannels, "Auto (match source)") }
+                .Concat(AudioFormats.ChannelCounts.Select(c => new FormatOption(c, AudioFormats.ChannelLabel(c)))).ToList();
         }
 
         private static void SelectValue(System.Windows.Controls.ComboBox combo, int value, int fallback)
@@ -188,7 +189,7 @@ namespace AudioStreamer
             var options = combo.ItemsSource.Cast<FormatOption>().ToList();
             combo.SelectedItem = options.FirstOrDefault(o => o.Value == value)
                               ?? options.FirstOrDefault(o => o.Value == fallback)
-                              ?? options.First();   // fallback is always a catalog default, so this last leg never runs — belt-and-suspenders
+                              ?? options.First();   // the fallback value is always present in the list (catalog default or Auto sentinel), so this last leg never runs — belt-and-suspenders
         }
 
         private static int SelectedValue(System.Windows.Controls.ComboBox combo, int fallback) =>
@@ -224,7 +225,7 @@ namespace AudioStreamer
             ReceiverMaxLatencyTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverMaxLatencyMilliseconds.ToString();
             SelectValue(SampleRateCombo, audioStreamerLogic.CurrentConfig.SampleRate, AudioFormats.DefaultSampleRate);
             SelectValue(BitDepthCombo, audioStreamerLogic.CurrentConfig.BitsPerSample, AudioFormats.DefaultBitDepth);
-            SelectValue(ChannelsCombo, audioStreamerLogic.CurrentConfig.Channels, AudioFormats.DefaultChannels);
+            SelectValue(ChannelsCombo, audioStreamerLogic.CurrentConfig.Channels, AudioFormats.AutoChannels);
             StartMinimizedCheckBox.IsChecked = audioStreamerLogic.CurrentConfig.StartMinimized;
             suppressStartupToggle = true;
             StartWithWindowsCheckBox.IsChecked = startupService.IsEnabled;

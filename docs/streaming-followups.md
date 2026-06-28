@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Scope: the sender (`StartSender`) and receiver (`StartReceiver`) hot paths in
-[`AudioStreamerLogic.cs`](../AudioStreamerLogic.cs). Goal: low-latency, reliable
+[`AudioStreamerLogic.cs`](../Core/AudioStreamerLogic.cs) and the `Streaming/` sessions. Goal: low-latency, reliable
 LAN audio streaming.
 
 Status legend: **[DONE]** implemented · **[TODO]** not yet done · **[VERIFY]** needs confirmation.
@@ -182,7 +182,7 @@ The chosen window is logged at receiver start (`Reorder window: N packets`).
 
 ## 14. Session extraction + receiver output device-loss recovery  **[DONE]**
 
-Structural pass (plan: `docs/2026-06-28-session-extraction-and-receiver-recovery-plan.md`).
+Structural pass (plan: `docs/superpowers/plans/2026-06-28-session-extraction-and-receiver-recovery.md`).
 `AudioStreamerLogic` is now a thin coordinator; the sender and receiver hot paths
 moved into `SenderSession`/`ReceiverSession` (both `IStreamSession`), and the on-wire
 framing + socket constants into a static `WireProtocol` (`WriteFormatHeader`/

@@ -21,7 +21,9 @@ namespace AudioStreamer
             public int ReceiverMaxLatencyMilliseconds { get; set; } = 150;   // drift cap; trims backlog to half this. 150 keeps lip-sync tight while leaving jitter headroom (400 was too laggy in the field)
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;
-            public int Channels { get; set; } = 2;
+            // 0 == AudioFormats.AutoChannels: match the render endpoint's mix-format channel count. Existing
+            // config.json files keep their stored explicit value (LoadConfig only adds missing fields).
+            public int Channels { get; set; } = 0;
             public bool StartMinimized { get; set; } = false;   // first run shows the window so it can be configured before starting
         }
 
