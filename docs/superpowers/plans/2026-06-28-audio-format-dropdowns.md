@@ -272,8 +272,8 @@ Expected: `0 Warning(s)`, `0 Error(s)`. (If the compiler reports `WriteFormatHea
 
 - [ ] **Step 5: Grep for stragglers**
 
-Run: `git grep -n "ReadFormatHeader\|WriteFormatHeader"`
-Expected: no matches in `*.cs` (only possibly docs, handled in Task 4).
+Run: `git grep -n "ReadFormatHeader\|WriteFormatHeader" -- '*.cs'`
+Expected: **no matches** (scoped to `.cs`; the historical plan/spec docs still mention the old names and are fine — Task 4 only updates CLAUDE.md + the followups doc).
 
 - [ ] **Step 6: Runtime smoke — the 44.1 kHz regression check**
 
@@ -339,9 +339,10 @@ Add a nested type and two helpers to the `MainWindow` class (e.g. just above `Pa
 
         private static void SelectValue(ComboBox combo, int value, int fallback)
         {
-            var options = combo.ItemsSource.Cast<FormatOption>();
+            var options = combo.ItemsSource.Cast<FormatOption>().ToList();
             combo.SelectedItem = options.FirstOrDefault(o => o.Value == value)
-                              ?? options.First(o => o.Value == fallback);
+                              ?? options.FirstOrDefault(o => o.Value == fallback)
+                              ?? options.First();   // fallback is always a catalog default, so this last leg never runs — belt-and-suspenders
         }
 
         private static int SelectedValue(ComboBox combo, int fallback) =>
