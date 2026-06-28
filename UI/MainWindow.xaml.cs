@@ -173,6 +173,27 @@ namespace AudioStreamer
                 DiagnosticsText.Text = string.Empty;
         }
 
+        // Dropdown item: carries the int Config value, displays the friendly label (ToString is what the ComboBox renders).
+        private sealed record FormatOption(int Value, string Label) { public override string ToString() => Label; }
+
+        private void PopulateFormatDropdowns()
+        {
+            SampleRateCombo.ItemsSource = AudioFormats.SampleRates.Select(r => new FormatOption(r, AudioFormats.RateLabel(r))).ToList();
+            BitDepthCombo.ItemsSource   = AudioFormats.BitDepths.Select(b => new FormatOption(b, AudioFormats.DepthLabel(b))).ToList();
+            ChannelsCombo.ItemsSource   = AudioFormats.ChannelCounts.Select(c => new FormatOption(c, AudioFormats.ChannelLabel(c))).ToList();
+        }
+
+        private static void SelectValue(System.Windows.Controls.ComboBox combo, int value, int fallback)
+        {
+            var options = combo.ItemsSource.Cast<FormatOption>().ToList();
+            combo.SelectedItem = options.FirstOrDefault(o => o.Value == value)
+                              ?? options.FirstOrDefault(o => o.Value == fallback)
+                              ?? options.First();   // fallback is always a catalog default, so this last leg never runs — belt-and-suspenders
+        }
+
+        private static int SelectedValue(System.Windows.Controls.ComboBox combo, int fallback) =>
+            combo.SelectedItem is FormatOption o ? o.Value : fallback;
+
         private static int ParseOr(string text, int fallback) => int.TryParse(text, out int value) ? value : fallback;
 
         private void UpdateConfigFromUI()
@@ -185,14 +206,15 @@ namespace AudioStreamer
             cfg.ReceiverAudioBufferMillisecondsLength = ParseOr(ReceiverAudioBufferTextBox.Text, cfg.ReceiverAudioBufferMillisecondsLength);
             cfg.ReceiverAudioLatencyMilliseconds = ParseOr(ReceiverAudioLatencyTextBox.Text, cfg.ReceiverAudioLatencyMilliseconds);
             cfg.ReceiverMaxLatencyMilliseconds = ParseOr(ReceiverMaxLatencyTextBox.Text, cfg.ReceiverMaxLatencyMilliseconds);
-            cfg.SampleRate = ParseOr(SampleRateTextBox.Text, cfg.SampleRate);
-            cfg.BitsPerSample = ParseOr(BitsPerSampleTextBox.Text, cfg.BitsPerSample);
-            cfg.Channels = ParseOr(ChannelsTextBox.Text, cfg.Channels);
+            cfg.SampleRate = SelectedValue(SampleRateCombo, cfg.SampleRate);
+            cfg.BitsPerSample = SelectedValue(BitDepthCombo, cfg.BitsPerSample);
+            cfg.Channels = SelectedValue(ChannelsCombo, cfg.Channels);
             cfg.StartMinimized = StartMinimizedCheckBox.IsChecked ?? false;
         }
 
         private void PopulateUIFromConfig()
         {
+            PopulateFormatDropdowns();
             ModeComboBox.SelectedItem = ModeComboBox.Items.Cast<ComboBoxItem>().FirstOrDefault(item => item.Content.ToString() == audioStreamerLogic.CurrentConfig.Mode.ToString());
             HostNameTextBox.Text = audioStreamerLogic.CurrentConfig.HostName;
             PortTextBox.Text = audioStreamerLogic.CurrentConfig.Port.ToString();
@@ -200,9 +222,9 @@ namespace AudioStreamer
             ReceiverAudioBufferTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverAudioBufferMillisecondsLength.ToString();
             ReceiverAudioLatencyTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverAudioLatencyMilliseconds.ToString();
             ReceiverMaxLatencyTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverMaxLatencyMilliseconds.ToString();
-            SampleRateTextBox.Text = audioStreamerLogic.CurrentConfig.SampleRate.ToString();
-            BitsPerSampleTextBox.Text = audioStreamerLogic.CurrentConfig.BitsPerSample.ToString();
-            ChannelsTextBox.Text = audioStreamerLogic.CurrentConfig.Channels.ToString();
+            SelectValue(SampleRateCombo, audioStreamerLogic.CurrentConfig.SampleRate, AudioFormats.DefaultSampleRate);
+            SelectValue(BitDepthCombo, audioStreamerLogic.CurrentConfig.BitsPerSample, AudioFormats.DefaultBitDepth);
+            SelectValue(ChannelsCombo, audioStreamerLogic.CurrentConfig.Channels, AudioFormats.DefaultChannels);
             StartMinimizedCheckBox.IsChecked = audioStreamerLogic.CurrentConfig.StartMinimized;
             suppressStartupToggle = true;
             StartWithWindowsCheckBox.IsChecked = startupService.IsEnabled;

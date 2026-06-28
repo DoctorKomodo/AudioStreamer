@@ -73,7 +73,7 @@ namespace AudioStreamer
             {
                 capture = new TweakedWasapiLoopbackCapture(config.SenderAudioBufferMillisecondsLength)
                 {
-                    WaveFormat = new WaveFormat(config.SampleRate, config.BitsPerSample, config.Channels)
+                    WaveFormat = AudioFormats.ToWaveFormat(config.SampleRate, config.BitsPerSample, config.Channels)
                 };
 
                 // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
@@ -86,10 +86,10 @@ namespace AudioStreamer
                 int maxChunk = Math.Max(blockAlign, (WireProtocol.MaxUdpAudioBytes / blockAlign) * blockAlign);
 
                 // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
-                // dropout). The 3-byte format header is constant for the session, so write it once up front; the
-                // sequence byte at index 3 is overwritten per datagram.
+                // dropout). The 1-byte format code is constant for the session, so write it once up front; the
+                // sequence byte at index 1 is overwritten per datagram.
                 byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + maxChunk];
-                WireProtocol.WriteFormatHeader(sendBuffer, config.SampleRate, config.BitsPerSample, config.Channels);
+                WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(config.SampleRate, config.BitsPerSample, config.Channels));
 
                 var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
                 int sentPackets = 0;
