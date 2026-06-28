@@ -38,8 +38,6 @@
 - [ ] **Step 1: Create `Streaming/AudioFormats.cs`**
 
 ```csharp
-using System.Globalization;
-
 namespace AudioStreamer
 {
     /// <summary>
@@ -104,13 +102,11 @@ namespace AudioStreamer
             return -1;
         }
 
-        // Invariant culture so the decimal is always a dot ("44.1 kHz") regardless of the OS locale
-        // (a comma-decimal locale would otherwise render "44,1 kHz"). The whole-kHz branch and DepthLabel
-        // format small integers only (no separators), so they're locale-safe as-is.
-        public static string RateLabel(int hz) =>
-            hz % 1000 == 0
-                ? $"{hz / 1000} kHz"
-                : string.Create(CultureInfo.InvariantCulture, $"{hz / 1000.0:0.0} kHz");
+        // Raw Hz, matching what Windows shows natively (Sound > Advanced lists "44100 Hz"). Default integer
+        // formatting inserts no group separators (grouping is opt-in via "N"/custom formats), so this is
+        // locale-safe with no InvariantCulture needed — and it sidesteps the decimal-separator issue that
+        // a "44.1 kHz" form would have on comma-decimal locales.
+        public static string RateLabel(int hz) => $"{hz} Hz";
 
         public static string DepthLabel(int bits) => $"{bits}-bit";
 
@@ -133,7 +129,7 @@ Expected: `0 Warning(s)`, `0 Error(s)`.
 
 - [ ] **Step 3: Verify the catalog by reasoning (no test framework)**
 
-Confirm by inspection: `Formats` has `6*3*4 = 72` entries; `FromCode((byte)i)` for `i` in `0..71` returns the same `Format` that produced code `i` (so `FromCode(ToCode(r,d,c))` round-trips for every catalog combo); `FromCode(72)`..`FromCode(255)` return `null`; `ToCode(48000,16,2)` is in range (the default, code `13`). `RateLabel(44100) == "44.1 kHz"`, `RateLabel(48000) == "48 kHz"`. The end-to-end check happens in Task 2 Step 6.
+Confirm by inspection: `Formats` has `6*3*4 = 72` entries; `FromCode((byte)i)` for `i` in `0..71` returns the same `Format` that produced code `i` (so `FromCode(ToCode(r,d,c))` round-trips for every catalog combo); `FromCode(72)`..`FromCode(255)` return `null`; `ToCode(48000,16,2)` is in range (the default, code `13`). `RateLabel(44100) == "44100 Hz"`, `RateLabel(48000) == "48000 Hz"` (locale-independent). The end-to-end check happens in Task 2 Step 6.
 
 - [ ] **Step 4: Commit**
 

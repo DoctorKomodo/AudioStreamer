@@ -71,7 +71,7 @@ public static class AudioFormats
     public static Format? FromCode(byte code);
 
     // UI labels.
-    public static string RateLabel(int hz);     // "44.1 kHz", "48 kHz", "88.2 kHz", ...
+    public static string RateLabel(int hz);     // "44100 Hz", "48000 Hz", ... (raw Hz, matches Windows; locale-safe)
     public static string DepthLabel(int bits);  // "16-bit"
     public static string ChannelLabel(int ch);  // "1 (Mono)", "2 (Stereo)", "6 (5.1)", "8 (7.1)"
 }
