@@ -44,6 +44,11 @@ namespace AudioStreamer
         private double minBacklogMs = double.MaxValue;
         private int maxLatencyMs;
 
+        // The active wire format code, set in BuildPipeline. The receive loop rebuilds when an incoming code differs.
+        private byte currentFormatCode;
+        // Log-once guard for an unknown code seen mid-stream (the InitializeReceiver guard's flag is a local there).
+        private bool loggedBadFormatMidStream;
+
         public ReceiverSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report)
         {
             this.config = config;
@@ -168,6 +173,33 @@ namespace AudioStreamer
             });
         }
 
+        // (Re)builds the format-dependent pipeline — BufferedWaveProvider, its underrun meter, and the WasapiOut
+        // output — for a catalog format, and records the active wire code. Called from InitializeReceiver (first
+        // packet) and from the receive loop on a mid-stream format change (a sender device-change can flip the
+        // channel count under Auto). BuildAndPlayOutput clears to the live edge and is serialized by outputLock,
+        // so this composes with the PlaybackStopped recovery path. Set the fields BEFORE BuildAndPlayOutput so the
+        // new WasapiOut is wired to the new buffer.
+        private void BuildPipeline(AudioFormats.Format fmt, byte code)
+        {
+            currentFormatCode = code;
+            bufferedWaveProvider = new BufferedWaveProvider(AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
+            {
+                BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
+                DiscardOnBufferOverflow = true
+            };
+            underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
+            BuildAndPlayOutput();
+        }
+
+        // ReorderBuffer emit target. Reads the bufferedWaveProvider field live, so a rebuild that swaps the field
+        // re-points this without rebuilding the delegate. Shared by the initial and post-rebuild ReorderBuffers.
+        private void EmitSamples(byte[] buf, int off, int cnt)
+        {
+            if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
+                overflows++;
+            bufferedWaveProvider.AddSamples(buf, off, cnt);
+        }
+
         private void InitializeReceiver()
         {
             byte[] receiveBuffer = new byte[65536];
@@ -199,13 +231,7 @@ namespace AudioStreamer
                             continue;
                         }
                         logLine($"Sample rate: {fmt.SampleRate}, Bit depth: {fmt.BitDepth}, Channels: {fmt.Channels} received from sender");
-                        bufferedWaveProvider = new BufferedWaveProvider(AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
-                        {
-                            BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
-                            DiscardOnBufferOverflow = true
-                        };
-                        underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
-                        BuildAndPlayOutput();
+                        BuildPipeline(fmt, code);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
                         Task.Run(ReceiveAudio, token);
                         break;
                     }
@@ -228,12 +254,7 @@ namespace AudioStreamer
 
             int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
             logLine($"Reorder window: {reorderWindow} packets");
-            var reorderBuffer = new ReorderBuffer(reorderWindow, (buf, off, cnt) =>
-            {
-                if (bufferedWaveProvider.BufferedBytes + cnt > bufferedWaveProvider.BufferLength)
-                    overflows++;
-                bufferedWaveProvider.AddSamples(buf, off, cnt);
-            });
+            var reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
 
             while (!token.IsCancellationRequested)
             {
@@ -242,6 +263,30 @@ namespace AudioStreamer
                     int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
                     if (received > WireProtocol.HeaderBytes)
                     {
+                        byte code = WireProtocol.ReadFormatCode(receiveBuffer);
+                        if (code != currentFormatCode)
+                        {
+                            if (AudioFormats.FromCode(code) is not { } newFmt)
+                            {
+                                // Unknown code mid-stream (foreign datagram / version mismatch): ignore, log once,
+                                // no rebuild. Steady-state path stays this single compare when code == current.
+                                if (!loggedBadFormatMidStream)
+                                {
+                                    logLine($"Ignoring mid-stream datagram with unknown format code {code}.");
+                                    loggedBadFormatMidStream = true;
+                                }
+                                continue;
+                            }
+
+                            // Valid new format: rebuild the whole pipeline BEFORE feeding this datagram, so no
+                            // old-format-aligned bytes land in the new buffer. Single-threaded loop => atomic vs AddSamples.
+                            logLine($"Wire format changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch; rebuilding output.");
+                            BuildPipeline(newFmt, code);
+                            reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                            reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
+                            logLine($"Reorder window: {reorderWindow} packets");
+                        }
+
                         int payload = received - WireProtocol.HeaderBytes;
                         packets++;
                         payloadBytes += payload;
