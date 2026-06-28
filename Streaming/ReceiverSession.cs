@@ -111,6 +111,13 @@ namespace AudioStreamer
                 // isRunning is already true, so this passes.
                 if (!isRunning)
                     return;
+                if (wasapiOut is { } previous)   // mid-stream rebuild: tear down the old output before replacing it
+                {
+                    previous.PlaybackStopped -= OnPlaybackStopped;   // unsubscribe first so Stop() can't re-enter recovery
+                    try { previous.Stop(); } catch { /* already stopped by the OS */ }
+                    previous.Dispose();
+                    wasapiOut = null;
+                }
                 bufferedWaveProvider.ClearBuffer();   // no-op on first build (buffer empty); live-edge flush on rebuild
                 var output = new WasapiOut(AudioClientShareMode.Shared, config.ReceiverAudioLatencyMilliseconds);
                 output.Init(underrunMeter);
@@ -176,9 +183,10 @@ namespace AudioStreamer
         // (Re)builds the format-dependent pipeline — BufferedWaveProvider, its underrun meter, and the WasapiOut
         // output — for a catalog format, and records the active wire code. Called from InitializeReceiver (first
         // packet) and from the receive loop on a mid-stream format change (a sender device-change can flip the
-        // channel count under Auto). BuildAndPlayOutput clears to the live edge and is serialized by outputLock,
-        // so this composes with the PlaybackStopped recovery path. Set the fields BEFORE BuildAndPlayOutput so the
-        // new WasapiOut is wired to the new buffer.
+        // channel count under Auto). The buffer/meter field swap here is safe because the receive loop is
+        // single-threaded (the only thread that touches those fields and calls AddSamples); only the WasapiOut
+        // create/teardown inside BuildAndPlayOutput is serialized by outputLock (against Stop() / PlaybackStopped
+        // recovery). Set the fields BEFORE BuildAndPlayOutput so the new WasapiOut is wired to the new buffer.
         private void BuildPipeline(AudioFormats.Format fmt, byte code)
         {
             currentFormatCode = code;
