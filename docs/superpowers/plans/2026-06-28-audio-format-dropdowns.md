@@ -38,6 +38,8 @@
 - [ ] **Step 1: Create `Streaming/AudioFormats.cs`**
 
 ```csharp
+using System.Globalization;
+
 namespace AudioStreamer
 {
     /// <summary>
@@ -102,8 +104,13 @@ namespace AudioStreamer
             return -1;
         }
 
+        // Invariant culture so the decimal is always a dot ("44.1 kHz") regardless of the OS locale
+        // (a comma-decimal locale would otherwise render "44,1 kHz"). The whole-kHz branch and DepthLabel
+        // format small integers only (no separators), so they're locale-safe as-is.
         public static string RateLabel(int hz) =>
-            hz % 1000 == 0 ? $"{hz / 1000} kHz" : $"{hz / 1000.0:0.0} kHz";   // 48000 -> "48 kHz", 44100 -> "44.1 kHz"
+            hz % 1000 == 0
+                ? $"{hz / 1000} kHz"
+                : string.Create(CultureInfo.InvariantCulture, $"{hz / 1000.0:0.0} kHz");
 
         public static string DepthLabel(int bits) => $"{bits}-bit";
 
