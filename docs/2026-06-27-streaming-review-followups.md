@@ -222,18 +222,20 @@ clears" guard — the same `loggedWaiting`-style bool already used by `RestartCa
 `RestartOutput`. Reset the flag after a clean send/receive so a later, distinct fault logs
 again. Low risk, no behaviour change beyond log volume.
 
-## 16. First-packet format is trusted blindly  **[TODO]**
+## 16. First-packet format is trusted blindly  **[DONE]**
 
-Found in the streaming review; not yet implemented. `ReceiverSession.InitializeReceiver`
-accepts any datagram `>= FormatHeaderBytes` and feeds `WireProtocol.ReadFormatHeader`
-straight into `new WaveFormat(sampleRate, bitDepth, channels)`. A `sampleRate` of 0 (etc.)
-throws, is caught, and the loop keeps waiting, so it self-corrects for *obvious* garbage —
-but a *plausible-looking* stray header from an unrelated app on the same port (e.g. 44/16/2)
-would build a wrong-format pipeline and play noise until restart. Likelihood is low on a
-trusted LAN, which is why it's deferred. Fix: a cheap sanity check before building the
-provider — `sampleRate` in a known set (8/11.025/16/22.05/32/44.1/48/88.2/96/176.4/192 kHz),
-`bitDepth` in {16, 24, 32}, `channels` in 1–8 — and ignore the datagram (keep waiting) if it
-fails. Pairs naturally with item 15's first-packet logging.
+Resolved by the audio-format-dropdowns work (spec/plan:
+`docs/superpowers/specs/2026-06-28-audio-format-selection-design.md`). The wire format
+descriptor is now a **1-byte index** into the shared `AudioFormats.Formats` catalog instead
+of three packed fields, so `ReceiverSession.InitializeReceiver` reads the code and calls
+`AudioFormats.FromCode(code)`; an out-of-range code (a foreign datagram on the port, or a
+version mismatch) is rejected — logged once, then the loop keeps waiting — rather than
+building a bogus `WaveFormat`. This subsumes the originally-proposed multi-field sanity
+check: a single membership test now covers it. Note the original "known set" above was itself
+inconsistent — its fractional-kHz rates (11.025/22.05/44.1/88.2/176.4) could not round-trip
+the old `sampleRate/1000` byte header; the indexed catalog stores the true rate, so 44.1 kHz
+now works exactly. The sender side is also guarded: selection-only dropdowns make an invalid
+combination unrepresentable in the first place.
 
 ## 17. Sender `Start()` leaks the `UdpClient` if `IPAddress.Parse` throws  **[TODO]**
 
@@ -246,18 +248,18 @@ null `udpClient`. Currently masked because `MainWindow.StartSession` pre-validat
 with `IPAddress.TryParse` before calling `Start()`, so this is only reachable if `Start()` is
 invoked directly with a bad host. Fix: parse the address into a local first
 (`var ip = IPAddress.Parse(...)`) — or wrap the socket setup so a throw disposes `client` —
-and only then `Connect`. Trivial; do it alongside items 15/16.
+and only then `Connect`. Trivial; do it alongside item 15.
 
 ---
 
 ## Wire protocol (current)
 
-Each UDP datagram: **4-byte header + raw PCM** (`WireProtocol`).
-- bytes 0–2: wave format — `sampleRate/1000`, `bitDepth`, `channels` (`WriteFormatHeader`/`ReadFormatHeader`).
-- byte 3: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
-- byte 4+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
+Each UDP datagram: **2-byte header + raw PCM** (`WireProtocol`).
+- byte 0: format code — index into `AudioFormats.Formats` (72-entry catalog) (`WriteFormatCode`/`ReadFormatCode`; `AudioFormats.ToCode`/`FromCode`).
+- byte 1: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
+- byte 2+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
 
-Both ends must run the same version (true of the format header already).
+Both ends must run the same version (the catalog order is part of the contract).
 
 ---
 
@@ -265,9 +267,9 @@ Both ends must run the same version (true of the format header already).
 
 All review items (1–9) plus the field-found underrun gap (10), loss/reorder
 classifier (11), reorder buffer (12), data-rate-scaled reorder window (13), and the
-session extraction + receiver output recovery (14) are implemented. **Pending [TODO]:**
-log-flood suppression on the hot-path catch blocks (15), a first-packet format sanity
-check (16), and the sender `IPAddress.Parse` socket leak (17) — low-priority hardening
-deferred from the streaming review and the branch review. Remaining validation caveat:
-socket-level and real-code component tests plus the user's own two-machine runs — no
-automated live-audio test.
+session extraction + receiver output recovery (14), and the audio-format dropdowns +
+indexed wire code (which closed the first-packet guard, 16) are implemented. **Pending
+[TODO]:** log-flood suppression on the hot-path catch blocks (15) and the sender
+`IPAddress.Parse` socket leak (17) — low-priority hardening deferred from the streaming and
+branch reviews. Remaining validation caveat: socket-level and real-code component tests plus
+the user's own two-machine runs — no automated live-audio test.
