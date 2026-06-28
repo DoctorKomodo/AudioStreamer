@@ -8,6 +8,8 @@ AudioStreamer is a Windows-only WPF desktop app (.NET 10, `net10.0-windows`, sin
 
 Originally created in Visual Studio; it builds and debugs entirely from the `dotnet` CLI / VS Code (see `.vscode/`). Requires the .NET 10 Windows Desktop runtime.
 
+**Deferred-work backlog:** the running list of streaming-review findings with per-item `[DONE]`/`[TODO]` status lives in [`docs/streaming-followups.md`](docs/streaming-followups.md) — check there for known low-priority hardening items (currently open: log-flood suppression, and the sender `IPAddress.Parse` socket leak on a bad Host Name). Per-feature design specs and implementation plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/`.
+
 ## Commands
 
 ```powershell

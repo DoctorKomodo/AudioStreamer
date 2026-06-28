@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Scope: the sender (`StartSender`) and receiver (`StartReceiver`) hot paths in
-[`AudioStreamerLogic.cs`](../AudioStreamerLogic.cs). Goal: low-latency, reliable
+[`AudioStreamerLogic.cs`](../Core/AudioStreamerLogic.cs) and the `Streaming/` sessions. Goal: low-latency, reliable
 LAN audio streaming.
 
 Status legend: **[DONE]** implemented · **[TODO]** not yet done · **[VERIFY]** needs confirmation.
