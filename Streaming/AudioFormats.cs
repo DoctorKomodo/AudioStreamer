@@ -1,3 +1,5 @@
+using NAudio.Wave;
+
 namespace AudioStreamer
 {
     /// <summary>
@@ -50,6 +52,18 @@ namespace AudioStreamer
 
         /// <summary>Wire code -> format, or null if the code is out of range (the receiver guard).</summary>
         public static Format? FromCode(byte code) => code < Formats.Count ? Formats[code] : null;
+
+        /// <summary>
+        /// Builds the NAudio WaveFormat for a catalog format. 32-bit maps to IEEE float
+        /// (CreateIeeeFloatWaveFormat) — NAudio's int-args WaveFormat ctor would produce 32-bit *integer*
+        /// PCM, which WASAPI shared mode rejects on typical hardware (its mix format is 32-bit float).
+        /// 16/24-bit are genuine integer PCM. Both ends must build the format the same way, so this is the
+        /// single construction point.
+        /// </summary>
+        public static WaveFormat ToWaveFormat(int sampleRate, int bitDepth, int channels) =>
+            bitDepth == 32
+                ? WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels)
+                : new WaveFormat(sampleRate, bitDepth, channels);
 
         private static int IndexOf(int sampleRate, int bitDepth, int channels)
         {

@@ -73,7 +73,7 @@ namespace AudioStreamer
             {
                 capture = new TweakedWasapiLoopbackCapture(config.SenderAudioBufferMillisecondsLength)
                 {
-                    WaveFormat = new WaveFormat(config.SampleRate, config.BitsPerSample, config.Channels)
+                    WaveFormat = AudioFormats.ToWaveFormat(config.SampleRate, config.BitsPerSample, config.Channels)
                 };
 
                 // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a

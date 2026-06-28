@@ -184,7 +184,7 @@ namespace AudioStreamer
                 try
                 {
                     int received = socket.ReceiveFrom(receiveBuffer, ref remoteEP);
-                    if (received >= WireProtocol.FormatHeaderBytes)
+                    if (received >= WireProtocol.HeaderBytes)
                     {
                         byte code = WireProtocol.ReadFormatCode(receiveBuffer);
                         if (AudioFormats.FromCode(code) is not { } fmt)
@@ -199,7 +199,7 @@ namespace AudioStreamer
                             continue;
                         }
                         logLine($"Sample rate: {fmt.SampleRate}, Bit depth: {fmt.BitDepth}, Channels: {fmt.Channels} received from sender");
-                        bufferedWaveProvider = new BufferedWaveProvider(new WaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
+                        bufferedWaveProvider = new BufferedWaveProvider(AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
                         {
                             BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
                             DiscardOnBufferOverflow = true
