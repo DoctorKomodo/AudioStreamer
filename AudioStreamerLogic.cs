@@ -32,7 +32,15 @@ namespace AudioStreamer
         public bool IsRunning => session?.IsRunning ?? false;
 
         public event Action<DiagnosticsSnapshot>? Diagnostics;
-        private readonly DiagnosticsLog diagnosticsLog = new("diagnostics.log");
+
+        // App-data files live next to the executable, NOT in the current working directory. At login via the
+        // HKCU \Run key ("start with Windows") the CWD is C:\Windows\system32 — a Run value can't carry a working
+        // directory — so a relative "config.json"/"diagnostics.log" would resolve there and the config write would
+        // throw UnauthorizedAccessException, crashing startup. AppContext.BaseDirectory is the install dir
+        // (writable per-user %LOCALAPPDATA%\AudioStreamer) and equals the CWD for manual / dotnet run launches, so
+        // manual behaviour is unchanged.
+        private static readonly string ConfigPath = Path.Combine(AppContext.BaseDirectory, "config.json");
+        private readonly DiagnosticsLog diagnosticsLog = new(Path.Combine(AppContext.BaseDirectory, "diagnostics.log"));
 
         // Cached because System.Text.Json recommends reusing options instances. Indented to keep
         // config.json hand-editable; default enum/property handling matches the old Newtonsoft output
@@ -87,7 +95,7 @@ namespace AudioStreamer
         {
             try
             {
-                string configText = File.ReadAllText("config.json");
+                string configText = File.ReadAllText(ConfigPath);
                 if (!string.IsNullOrEmpty(configText))
                 {
                     CurrentConfig = JsonSerializer.Deserialize<Config>(configText) ?? new Config();
@@ -102,7 +110,7 @@ namespace AudioStreamer
 
         public void SaveConfig()
         {
-            File.WriteAllText("config.json", JsonSerializer.Serialize(CurrentConfig, JsonOptions));
+            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(CurrentConfig, JsonOptions));
         }
     }
 }
