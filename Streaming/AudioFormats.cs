@@ -18,6 +18,10 @@ namespace AudioStreamer
         public const int DefaultBitDepth   = 16;
         public const int DefaultChannels   = 2;
 
+        // Config.Channels sentinel: capture at the render endpoint's mix-format channel count instead of a fixed
+        // value. Never appears on the wire — the sender resolves it to a concrete catalog code before sending.
+        public const int AutoChannels = 0;
+
         public readonly record struct Format(int SampleRate, int BitDepth, int Channels);
 
         /// <summary>
@@ -52,6 +56,26 @@ namespace AudioStreamer
 
         /// <summary>Wire code -> format, or null if the code is out of range (the receiver guard).</summary>
         public static Format? FromCode(byte code) => code < Formats.Count ? Formats[code] : null;
+
+        /// <summary>
+        /// Resolves a configured channel count to a concrete catalog value for capture. An explicit request is
+        /// returned unchanged. <see cref="AutoChannels"/> resolves to the largest catalog channel count
+        /// &lt;= <paramref name="deviceNativeChannels"/> — never up-mixing, snapping down to a wire-representable
+        /// value (native 6→6, 8→8, 4→2, 2→2, 1→1). The floor is <c>ChannelCounts[0]</c>, so even a bogus small
+        /// native count yields a valid result. "Native" here is the WASAPI shared-mode mix-format channel count
+        /// (endpoint configuration), not the currently-playing content — see the design doc.
+        /// </summary>
+        public static int ResolveCaptureChannels(int configuredChannels, int deviceNativeChannels)
+        {
+            if (configuredChannels != AutoChannels)
+                return configuredChannels;
+
+            int best = ChannelCounts[0];
+            foreach (int c in ChannelCounts)
+                if (c <= deviceNativeChannels && c > best)
+                    best = c;
+            return best;
+        }
 
         /// <summary>
         /// Builds the NAudio capture/playback WaveFormat for a catalog format — always WAVEFORMATEXTENSIBLE,
