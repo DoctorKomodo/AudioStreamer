@@ -106,12 +106,15 @@ Constant changes: `CodecByteOffset` = **1** (new), `SequenceByteOffset` 1 → **
 one byte (1443 + 28 IP/UDP = 1471 ≤ 1500 — still no fragmentation). Opus frames are a few hundred
 bytes, far under the budget.
 
-New thin accessors (WireProtocol stays pure framing — it knows neither the catalog nor Opus):
+`CodecId` is a **public top-level enum** (not nested in the `internal WireProtocol`) because the
+persisted `public Config.Codec` property exposes it — a public property cannot expose an internal type
+(CS0053). The accessors stay in `WireProtocol` (pure framing — it knows neither the catalog nor Opus):
 
 ```csharp
-public enum CodecId : byte { Pcm = 0, Opus = 1 }
-public const int CodecByteOffset = 1;
+public enum CodecId : byte { Pcm = 0, Opus = 1 }   // public, top-level (declared alongside WireProtocol)
 
+// on WireProtocol:
+public const int CodecByteOffset = 1;
 public static void WriteCodec(byte[] dest, CodecId c) => dest[CodecByteOffset] = (byte)c;
 public static CodecId ReadCodec(byte[] src) => (CodecId)src[CodecByteOffset];
 ```
@@ -152,10 +155,10 @@ out (+ PLC on a gap)" on receive:
 ```csharp
 internal interface IAudioEncoder : IDisposable
 {
-    // Append captured PCM; invoke `emit(payload, length)` once per complete output frame
-    // (zero or more per call). PCM impl: today's MTU slicing. Opus impl: accumulate to one
-    // frame (OpusFrameSamples), then Encode.
-    void Push(byte[] pcm, int offset, int count, Action<byte[], int> emit);
+    // Append captured PCM; invoke `emit(payload, offset, length)` once per complete output frame
+    // (zero or more per call). The offset lets PCM emit straight from the capture buffer with no copy;
+    // Opus passes 0. PCM impl: today's MTU slicing. Opus impl: accumulate to one frame, then Encode.
+    void Push(byte[] pcm, int offset, int count, Action<byte[], int, int> emit);
 }
 
 internal interface IAudioDecoder : IDisposable
@@ -179,13 +182,13 @@ code), and route `DataAvailable` PCM through the encoder:
 ```csharp
 WireProtocol.WriteFormatCode(sendBuffer, formatCode);
 WireProtocol.WriteCodec(sendBuffer, config.Codec);     // Pcm or Opus
-var encoder = CodecFactory.CreateEncoder(config.Codec, format, logLine);
+var encoder = CodecFactory.CreateEncoder(config.Codec, format, frameSamples, logLine);
 // DataAvailable:
-encoder.Push(e.Buffer, 0, e.BytesRecorded, (payload, len) =>
+encoder.Push(e.Buffer, 0, e.BytesRecorded, (payload, off, len) =>
 {
     var socket = udpClient; if (socket == null) return;
     sendBuffer[WireProtocol.SequenceByteOffset] = sequence++;
-    Buffer.BlockCopy(payload, 0, sendBuffer, WireProtocol.HeaderBytes, len);
+    Buffer.BlockCopy(payload, off, sendBuffer, WireProtocol.HeaderBytes, len);
     socket.Send(sendBuffer, len + WireProtocol.HeaderBytes);
     // sentPackets/sentBytes accounting unchanged
 });
@@ -249,15 +252,22 @@ var reorderBuffer = new ReorderBuffer(reorderWindow,
     });
 ```
 
-**Reorder window must be frame-duration-based for Opus.** The existing `ComputeReorderWindow(format)`
-sizes the window as a *packet count* scaled by the PCM **byte rate**, calibrated to keep the give-up
-*time* ~constant assuming **MTU-sized PCM datagrams** (~130–200 pkt/s). For Opus the decoded `format` is
-still 48 kHz/16-bit/stereo, so it returns the same **8 packets** — but Opus's packet cadence is the
-*frame rate* (1000/frame ms), not the PCM MTU cadence, so a fixed 8-packet window gives the wrong
-give-up time: 20 ms at 2.5 ms frames, 80 ms at 10 ms, and **160 ms at 20 ms — past the 150 ms drift
-cap, which would then fire first and defeat concealment entirely.** So the Opus path must compute the
-window from frame duration to hit the same ~40 ms target: `windowPackets = ceil(targetMs / frameMs)`
-(→ 16 / 8 / 4 / 2 packets for 2.5 / 5 / 10 / 20 ms). The PCM path keeps `ComputeReorderWindow` as is.
+**Opus needs its own reorder window (a fixed bounded count).** The existing `ComputeReorderWindow(format)`
+sizes the window as a *packet count* scaled by the PCM **byte rate**, calibrated for **MTU-sized PCM
+datagrams** (~130–200 pkt/s). For Opus the decoded `format` is still 48 kHz/16-bit/stereo, so it returns
+the same **8 packets** — but Opus's packet cadence is the *frame rate* (1000/frame ms), so 8 packets is
+the wrong give-up *time*: 80 ms at 10 ms frames, and **160 ms at 20 ms — past the 150 ms drift cap,
+which would fire first and defeat concealment.** A frame-duration formula (`ceil(targetMs/frameMs)`)
+isn't usable either: the receiver doesn't know the sender's frame size before it decodes. So the Opus
+path uses a **fixed constant window of 4 packets** (`OpusReorderWindowPackets`), which keeps give-up
+time bounded at **10–80 ms across 2.5–20 ms frames** — always under the drift cap, and ~40 ms at the
+10 ms default (matching the PCM path's intent). The PCM path keeps `ComputeReorderWindow` unchanged.
+
+**PLC needs the learned frame length.** Opus concealment (`Decode(null, …)`) must be told how many
+samples to synthesise, but the sender's frame size isn't signalled. The decoder adapter therefore
+**remembers the sample count from its most recent successful decode** and conceals with that length.
+The first datagram is always a real decode (it establishes the reorder baseline), so a `Conceal` never
+fires before a length is known.
 
 ### 6. `Streaming/ReorderBuffer.cs` — additive `onLost` hook
 
@@ -342,7 +352,7 @@ Receiver: datagram[1] → ReadCodec → build PcmCodec | OpusDecoder (once; re-c
   delay adds a small *fixed* latency on top of the buffer backlog; it does not interact with the cap.
 - **Reorder window vs Opus packet cadence:** `ComputeReorderWindow` is calibrated for PCM datagram
   cadence; reused unchanged for Opus it mis-sizes the give-up time (up to 160 ms at 20 ms frames, past
-  the drift cap). The Opus path derives the window from frame duration instead (see §5).
+  the drift cap). The Opus path uses a fixed 4-packet window instead (bounded 10–80 ms; see §5).
 - **CPU / GC:** OpusSharp adds no per-call allocation and ~53 µs encode / ~15 µs decode (≈1 % of the
   10 ms budget) — see benchmark. Neither is a concern.
 
