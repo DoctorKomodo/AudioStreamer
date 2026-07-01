@@ -249,6 +249,16 @@ var reorderBuffer = new ReorderBuffer(reorderWindow,
     });
 ```
 
+**Reorder window must be frame-duration-based for Opus.** The existing `ComputeReorderWindow(format)`
+sizes the window as a *packet count* scaled by the PCM **byte rate**, calibrated to keep the give-up
+*time* ~constant assuming **MTU-sized PCM datagrams** (~130–200 pkt/s). For Opus the decoded `format` is
+still 48 kHz/16-bit/stereo, so it returns the same **8 packets** — but Opus's packet cadence is the
+*frame rate* (1000/frame ms), not the PCM MTU cadence, so a fixed 8-packet window gives the wrong
+give-up time: 20 ms at 2.5 ms frames, 80 ms at 10 ms, and **160 ms at 20 ms — past the 150 ms drift
+cap, which would then fire first and defeat concealment entirely.** So the Opus path must compute the
+window from frame duration to hit the same ~40 ms target: `windowPackets = ceil(targetMs / frameMs)`
+(→ 16 / 8 / 4 / 2 packets for 2.5 / 5 / 10 / 20 ms). The PCM path keeps `ComputeReorderWindow` as is.
+
 ### 6. `Streaming/ReorderBuffer.cs` — additive `onLost` hook
 
 Today, when the window fills, the buffer skips missing sequences:
@@ -330,6 +340,9 @@ Receiver: datagram[1] → ReadCodec → build PcmCodec | OpusDecoder (once; re-c
   output path; `BuildAndPlayOutput` still flushes to the live edge.
 - **Latency cap / drift control:** unchanged — it operates on decoded PCM backlog. Opus's algorithmic
   delay adds a small *fixed* latency on top of the buffer backlog; it does not interact with the cap.
+- **Reorder window vs Opus packet cadence:** `ComputeReorderWindow` is calibrated for PCM datagram
+  cadence; reused unchanged for Opus it mis-sizes the give-up time (up to 160 ms at 20 ms frames, past
+  the drift cap). The Opus path derives the window from frame duration instead (see §5).
 - **CPU / GC:** OpusSharp adds no per-call allocation and ~53 µs encode / ~15 µs decode (≈1 % of the
   10 ms budget) — see benchmark. Neither is a concern.
 
