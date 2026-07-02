@@ -12,6 +12,7 @@ namespace AudioStreamer
         private StartupService startupService;
         private bool suppressStartupToggle;
         private bool reallyExit;   // true only when the user picks Exit from the tray; otherwise X hides to tray
+        private bool sessionRunning;   // gates WaitingForDevice status updates so a late event can't overwrite "Idle"
         private System.Windows.Forms.NotifyIcon? trayIcon;
 
         public MainWindow()
@@ -19,6 +20,7 @@ namespace AudioStreamer
             InitializeComponent();
             audioStreamerLogic = new AudioStreamerLogic();
             audioStreamerLogic.Diagnostics += OnDiagnostics;
+            audioStreamerLogic.WaitingForDevice += OnWaitingForDevice;
             startupService = new StartupService();
             SetupTrayIcon();
             PopulateUIFromConfig();
@@ -75,6 +77,23 @@ namespace AudioStreamer
             Dispatcher.BeginInvoke((Action)(() => DiagnosticsText.Text = snapshot.ToCompactLine()));
         }
 
+        // A session raises this while it is (re)acquiring its audio device. Reflect it in the status line so a
+        // sender that started but is still waiting for an output device doesn't look like it's silently working.
+        private void OnWaitingForDevice(bool waiting)
+        {
+            Dispatcher.BeginInvoke((Action)(() =>
+            {
+                if (!sessionRunning)
+                    return;   // ignore a late event that arrives after Stop reset the status to Idle
+                string status = waiting
+                    ? $"Waiting for audio device... ({audioStreamerLogic.CurrentConfig.Mode})"
+                    : RunningStatus();
+                StatusText.Text = status;
+                if (trayIcon is not null)
+                    trayIcon.Text = "AudioStreamer — " + status;
+            }));
+        }
+
         private void ExitApp()
         {
             reallyExit = true;
@@ -96,6 +115,7 @@ namespace AudioStreamer
             audioStreamerLogic.SaveConfig();
             audioStreamerLogic.Stop();
             audioStreamerLogic.Diagnostics -= OnDiagnostics;
+            audioStreamerLogic.WaitingForDevice -= OnWaitingForDevice;
             trayIcon?.Dispose();
             trayIcon = null;
         }
@@ -156,14 +176,16 @@ namespace AudioStreamer
             SetRunningState(false);
         }
 
+        private string RunningStatus() =>
+            $"Running ({audioStreamerLogic.CurrentConfig.Mode}) on port {audioStreamerLogic.CurrentConfig.Port}";
+
         private void SetRunningState(bool running)
         {
+            sessionRunning = running;
             StartButton.IsEnabled = !running;
             StopButton.IsEnabled = running;
             SettingsPanel.IsEnabled = !running;
-            StatusText.Text = running
-                ? $"Running ({audioStreamerLogic.CurrentConfig.Mode}) on port {audioStreamerLogic.CurrentConfig.Port}"
-                : "Idle";
+            StatusText.Text = running ? RunningStatus() : "Idle";
             if (trayIcon is not null)
                 trayIcon.Text = running
                     ? $"AudioStreamer — Running ({audioStreamerLogic.CurrentConfig.Mode})"

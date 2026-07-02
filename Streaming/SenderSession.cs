@@ -15,6 +15,9 @@ namespace AudioStreamer
         private readonly AudioStreamerLogic.Config config;
         private readonly Action<string> logLine;
         private readonly Action<DiagnosticsSnapshot> report;
+        // Reports true while the capture is being (re)acquired and false once it is live, so the UI status
+        // line reflects "waiting for audio device" instead of a misleading "Running" during a device outage.
+        private readonly Action<bool> reportWaiting;
 
         // Serializes the sender capture lifecycle (build / start / stop / auto-rebuild) so the once-per-second
         // restart loop and a user Stop() can't race on waveSource or leave a live capture running after Stop.
@@ -25,11 +28,12 @@ namespace AudioStreamer
         private UdpClient? udpClient;
         private WasapiCapture? waveSource;
 
-        public SenderSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report)
+        public SenderSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report, Action<bool> reportWaiting)
         {
             this.config = config;
             this.logLine = logLine;
             this.report = report;
+            this.reportWaiting = reportWaiting;
         }
 
         public bool IsRunning => isRunning;
@@ -45,8 +49,24 @@ namespace AudioStreamer
             client.Connect(IPAddress.Parse(config.HostName), config.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
 
-            StartCapture();
+            // Mark running before building the capture so an initial device-not-ready failure can fall into the
+            // same once-per-second RestartCapture poll that recovers from mid-stream device loss (that loop runs
+            // while isRunning). At Windows login the default render endpoint is frequently not ready in the moment
+            // the app auto-starts (audio service still coming up, HDMI/monitor output still waking); without this
+            // the one-shot StartCapture would throw and leave the sender idle until a manual Start.
             isRunning = true;
+            try
+            {
+                StartCapture();
+            }
+            catch (Exception ex)
+            {
+                // Don't abort Start(): the socket is open and the session is live; poll until the device appears.
+                // A genuine misconfiguration (bad Host Name) is already rejected upstream before Start(), and a
+                // socket failure above throws before isRunning is set, so this only catches capture-device issues.
+                logLine($"Sender capture could not start yet ({ex.Message}); retrying until an audio output device is available...");
+                RestartCapture(null);
+            }
         }
 
         public void Stop()
@@ -162,6 +182,7 @@ namespace AudioStreamer
             // usually 32-bit float; the WASAPI shared-mode engine converts it to the requested format for us.)
             LogCaptureFormat(renderInfo, capture.WaveFormat);
             logLine("Streaming system audio to " + config.HostName + "...");
+            reportWaiting(false);   // capture is live — clear any "waiting for audio device" status
         }
 
         private void OnRecordingStopped(object? sender, StoppedEventArgs e)
@@ -201,6 +222,7 @@ namespace AudioStreamer
         {
             Task.Run(async () =>
             {
+                reportWaiting(true);      // surface "waiting for audio device" until a rebuild succeeds
                 deadCapture?.Dispose();   // off the RecordingStopped callback thread
                 bool loggedWaiting = false;
                 while (isRunning)
