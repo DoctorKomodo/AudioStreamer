@@ -35,6 +35,10 @@ namespace AudioStreamer
 
         public event Action<DiagnosticsSnapshot>? Diagnostics;
 
+        // Raised by a session while it is retrying to acquire its audio device (true) and when it resumes
+        // streaming (false), so the UI can show "waiting for audio device" instead of a misleading "Running".
+        public event Action<bool>? WaitingForDevice;
+
         // App-data files live next to the executable, NOT in the current working directory. At login via the
         // HKCU \Run key ("start with Windows") the CWD is C:\Windows\system32 — a Run value can't carry a working
         // directory — so a relative "config.json"/"diagnostics.log" would resolve there and the config write would
@@ -50,6 +54,8 @@ namespace AudioStreamer
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
+
+        private void ReportWaiting(bool waiting) => WaitingForDevice?.Invoke(waiting);
 
         private void Report(DiagnosticsSnapshot snapshot)
         {
@@ -68,7 +74,7 @@ namespace AudioStreamer
                 return;
 
             IStreamSession s = CurrentConfig.Mode == ModeType.Sender
-                ? new SenderSession(CurrentConfig, LogLine, Report)
+                ? new SenderSession(CurrentConfig, LogLine, Report, ReportWaiting)
                 : new ReceiverSession(CurrentConfig, LogLine, Report);
             try
             {
