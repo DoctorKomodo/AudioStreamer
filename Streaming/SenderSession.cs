@@ -40,7 +40,34 @@ namespace AudioStreamer
 
         public void Start()
         {
-            // Capture a local non-null reference so the closure and teardown don't depend on the nullable field.
+            // Mark running before opening the socket / building the capture so ANY "resource not ready at login"
+            // failure falls into the same once-per-second retry that recovers from mid-stream device loss (that
+            // loop runs while isRunning). At Windows login the app auto-starts before its dependencies are
+            // necessarily up: the network stack (NIC/DHCP) may have no route yet, so Connect() throws, and the
+            // default render endpoint may not be ready yet, so the loopback capture throws. Either one used to
+            // abort the start — and because the failure path never logged, it did so invisibly, leaving the
+            // sender idle with an empty log until a manual Start. Retrying rides out both transients.
+            isRunning = true;
+            try
+            {
+                OpenSocket();
+                StartCapture();
+            }
+            catch (Exception ex)
+            {
+                logLine($"Sender start could not complete yet ({ex.Message}); retrying until the network and audio device are available...");
+                RestartCapture(null);
+            }
+        }
+
+        // Opens the UDP socket to HostName:Port. Idempotent — a no-op once the socket exists — so the retry loop
+        // can call it every attempt without leaking sockets. Connect() can throw at login if the local network
+        // stack isn't up yet (no route to the LAN); that's a transient the retry loop rides out. (A genuinely bad
+        // Host Name is rejected upstream before Start() by the UI's IPAddress.TryParse guard.)
+        private void OpenSocket()
+        {
+            if (udpClient != null)
+                return;
             var client = new UdpClient();
             client.Client.SendBufferSize = WireProtocol.SocketBufferBytes;
             // On a Connect()ed UDP socket an ICMP "port unreachable" (receiver not up yet) otherwise surfaces as a
@@ -48,25 +75,6 @@ namespace AudioStreamer
             client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);
             client.Connect(IPAddress.Parse(config.HostName), config.Port);   // fixed remote; Send() needs no endpoint
             udpClient = client;
-
-            // Mark running before building the capture so an initial device-not-ready failure can fall into the
-            // same once-per-second RestartCapture poll that recovers from mid-stream device loss (that loop runs
-            // while isRunning). At Windows login the default render endpoint is frequently not ready in the moment
-            // the app auto-starts (audio service still coming up, HDMI/monitor output still waking); without this
-            // the one-shot StartCapture would throw and leave the sender idle until a manual Start.
-            isRunning = true;
-            try
-            {
-                StartCapture();
-            }
-            catch (Exception ex)
-            {
-                // Don't abort Start(): the socket is open and the session is live; poll until the device appears.
-                // A genuine misconfiguration (bad Host Name) is already rejected upstream before Start(), and a
-                // socket failure above throws before isRunning is set, so this only catches capture-device issues.
-                logLine($"Sender capture could not start yet ({ex.Message}); retrying until an audio output device is available...");
-                RestartCapture(null);
-            }
         }
 
         public void Stop()
@@ -234,9 +242,11 @@ namespace AudioStreamer
                         {
                             if (!isRunning)
                                 return;
+                            OpenSocket();     // retry the socket too: at login Connect() may have failed (network
+                                              // not ready), not just the capture. No-op once the socket is open.
                             StartCapture();   // reentrant lock; publishes waveSource only on success
                         }
-                        logLine("Sender capture restarted.");
+                        logLine("Sender start completed.");
                         return;
                     }
                     catch (Exception ex)

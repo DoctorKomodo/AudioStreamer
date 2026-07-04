@@ -55,6 +55,10 @@ namespace AudioStreamer
 
         private void LogLine(string line) => diagnosticsLog.Log(line);
 
+        /// <summary>Lets the UI record startup/decision breadcrumbs to diagnostics.log so an auto-start that
+        /// bails (e.g. StartMinimized off, or a start failure) leaves a trace instead of an empty log.</summary>
+        public void LogDiagnostic(string line) => LogLine(line);
+
         private void ReportWaiting(bool waiting) => WaitingForDevice?.Invoke(waiting);
 
         private void Report(DiagnosticsSnapshot snapshot)
