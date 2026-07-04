@@ -151,6 +151,9 @@ namespace AudioStreamer
 
         private void ReportStartFailure(string message, bool showErrorsAsDialog)
         {
+            // Always record the failure to diagnostics.log — a tray balloon at login is easy to miss, and a
+            // silent Idle with an empty log is exactly what made this hard to diagnose.
+            audioStreamerLogic.LogDiagnostic("Start failed: " + message);
             if (showErrorsAsDialog)
                 MessageBox.Show(message, "AudioStreamer", MessageBoxButton.OK, MessageBoxImage.Warning);
             else
@@ -160,11 +163,22 @@ namespace AudioStreamer
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
-            if (!audioStreamerLogic.CurrentConfig.StartMinimized)
+            // Breadcrumb on every launch so a boot always leaves a trace, even when it decides NOT to auto-start.
+            // This is the first thing written to diagnostics.log at startup: if a failing boot shows no "App
+            // loaded" line at all, the app never launched (a Start-with-Windows problem, not an app-logic one).
+            var cfg = audioStreamerLogic.CurrentConfig;
+            audioStreamerLogic.LogDiagnostic(
+                $"AudioStreamer v{AppVersion} loaded. StartMinimized={cfg.StartMinimized}, Mode={cfg.Mode}, Host='{cfg.HostName}', Port={cfg.Port}.");
+
+            if (!cfg.StartMinimized)
+            {
+                audioStreamerLogic.LogDiagnostic("StartMinimized is off — not auto-starting; waiting for a manual Start.");
                 return;
+            }
 
             WindowState = WindowState.Minimized;
             Hide();   // dock straight to the tray
+            audioStreamerLogic.LogDiagnostic("Auto-starting session (StartMinimized).");
             StartSession(showErrorsAsDialog: false);
             if (audioStreamerLogic.IsRunning)
                 trayIcon?.ShowBalloonTip(3000, "AudioStreamer", "Streaming started.", System.Windows.Forms.ToolTipIcon.Info);
@@ -272,6 +286,11 @@ namespace AudioStreamer
 
         private static string ExePath() =>
             System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName;
+
+        // The 4-part assembly version stamped from the csproj <Version> (e.g. "1.2.2.0"), logged on startup so a
+        // diagnostics.log makes it obvious which build produced it.
+        private static string AppVersion =>
+            System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
 
         private void UpdateModePanels()
         {
