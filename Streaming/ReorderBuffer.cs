@@ -8,6 +8,10 @@ namespace AudioStreamer
     /// so playback never stalls indefinitely. Runs on the receive thread; allocates only when actually holding
     /// an out-of-order datagram.
     /// </summary>
+    /// <remarks>
+    /// When the optional <c>onLost</c> delegate is supplied, it fires once per genuinely-skipped sequence so a
+    /// stateful decoder can conceal exactly one frame per loss.
+    /// </remarks>
     public sealed class ReorderBuffer
     {
         private readonly int maxDepth;

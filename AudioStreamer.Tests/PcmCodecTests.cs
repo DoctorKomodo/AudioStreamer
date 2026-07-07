@@ -15,7 +15,11 @@ namespace AudioStreamer.Tests
             var pcm = new byte[WireProtocol.MaxUdpAudioBytes + 400]; // one full slice + a remainder
             for (int i = 0; i < pcm.Length; i++) pcm[i] = (byte)i;
             var slices = new List<int>();
-            enc.Push(pcm, 0, pcm.Length, (payload, off, len) => slices.Add(len));
+            enc.Push(pcm, 0, pcm.Length, (payload, off, len) =>
+            {
+                Assert.Same(pcm, payload); // no-copy contract: emits directly from the capture buffer
+                slices.Add(len);
+            });
 
             int maxChunk = (WireProtocol.MaxUdpAudioBytes / Fmt.BlockAlign) * Fmt.BlockAlign; // 1440
             Assert.Equal(new[] { maxChunk, pcm.Length - maxChunk }, slices);
