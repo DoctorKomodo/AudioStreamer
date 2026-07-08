@@ -329,6 +329,22 @@ namespace AudioStreamer
                         CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
                         logLine($"Codec: {codec}");
                         BuildPipeline(fmt, code, codec);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
+
+                        // Flush datagrams that queued in the socket buffer while BuildPipeline activated the
+                        // WasapiOut render device (activation can take tens of ms). Discarding them lets playback
+                        // start at the live edge + preroll, so a receiver restart resumes with the same backlog as
+                        // a sender restart instead of carrying that one-time startup burst as extra latency. Only
+                        // packets already sitting in the socket are dropped (Available>0 => ReceiveFrom won't block);
+                        // the preroll silence covers the gap until the next live datagram.
+                        int flushed = 0;
+                        while (socket.Available > 0)
+                        {
+                            socket.ReceiveFrom(receiveBuffer, ref remoteEP);
+                            flushed++;
+                        }
+                        if (flushed > 0)
+                            logLine($"Flushed {flushed} datagram(s) queued during startup; starting at the live edge.");
+
                         // Call inline rather than a nested Task.Run: this method already runs on its own background
                         // thread (Start()'s Task.Run), and ReceiveAudio is the long-lived steady-state loop that
                         // touches the decoder. Running it inline keeps the whole handshake+streaming lifetime under
