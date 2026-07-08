@@ -206,7 +206,10 @@ namespace AudioStreamer
                     : "AudioStreamer — Idle";
             DiagnosticsText.Visibility = running ? Visibility.Visible : Visibility.Collapsed;
             if (!running)
+            {
                 DiagnosticsText.Text = string.Empty;
+                UpdateCodecGating();   // restore Opus/PCM per-control enablement after the blanket re-enable
+            }
         }
 
         // Dropdown item: carries the int Config value, displays the friendly label (ToString is what the ComboBox renders).
@@ -218,6 +221,13 @@ namespace AudioStreamer
             BitDepthCombo.ItemsSource   = AudioFormats.BitDepths.Select(b => new FormatOption(b, AudioFormats.DepthLabel(b))).ToList();
             ChannelsCombo.ItemsSource   = new[] { new FormatOption(AudioFormats.AutoChannels, "Auto (match source)") }
                 .Concat(AudioFormats.ChannelCounts.Select(c => new FormatOption(c, AudioFormats.ChannelLabel(c)))).ToList();
+            CodecCombo.ItemsSource = new[]
+            {
+                new FormatOption((int)CodecId.Pcm, "PCM (uncompressed)"),
+                new FormatOption((int)CodecId.Opus, "Opus (compressed)")
+            };
+            OpusFrameCombo.ItemsSource = AudioStreamerLogic.OpusFrameSizes
+                .Select(s => new FormatOption(s, $"{s * 1000.0 / 48000.0:0.#} ms")).ToList();
         }
 
         private static void SelectValue(System.Windows.Controls.ComboBox combo, int value, int fallback)
@@ -246,6 +256,8 @@ namespace AudioStreamer
             cfg.SampleRate = SelectedValue(SampleRateCombo, cfg.SampleRate);
             cfg.BitsPerSample = SelectedValue(BitDepthCombo, cfg.BitsPerSample);
             cfg.Channels = SelectedValue(ChannelsCombo, cfg.Channels);
+            cfg.Codec = (CodecId)SelectedValue(CodecCombo, (int)cfg.Codec);
+            cfg.OpusFrameSamples = SelectedValue(OpusFrameCombo, cfg.OpusFrameSamples);
             cfg.StartMinimized = StartMinimizedCheckBox.IsChecked ?? false;
         }
 
@@ -262,16 +274,32 @@ namespace AudioStreamer
             SelectValue(SampleRateCombo, audioStreamerLogic.CurrentConfig.SampleRate, AudioFormats.DefaultSampleRate);
             SelectValue(BitDepthCombo, audioStreamerLogic.CurrentConfig.BitsPerSample, AudioFormats.DefaultBitDepth);
             SelectValue(ChannelsCombo, audioStreamerLogic.CurrentConfig.Channels, AudioFormats.AutoChannels);
+            SelectValue(CodecCombo, (int)audioStreamerLogic.CurrentConfig.Codec, (int)CodecId.Pcm);
+            SelectValue(OpusFrameCombo, audioStreamerLogic.CurrentConfig.OpusFrameSamples, 480);
             StartMinimizedCheckBox.IsChecked = audioStreamerLogic.CurrentConfig.StartMinimized;
             suppressStartupToggle = true;
             StartWithWindowsCheckBox.IsChecked = startupService.IsEnabled;
             suppressStartupToggle = false;
             UpdateModePanels();
+            UpdateCodecGating();
         }
 
         private void ModeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             UpdateModePanels();
+        }
+
+        private void CodecCombo_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateCodecGating();
+
+        // Opus fixes the wire format at 48 kHz / 16-bit / stereo, so the format dropdowns are
+        // disabled while it's selected and the frame-size dropdown is enabled only then.
+        private void UpdateCodecGating()
+        {
+            bool opus = SelectedValue(CodecCombo, (int)CodecId.Pcm) == (int)CodecId.Opus;
+            SampleRateCombo.IsEnabled = !opus;
+            BitDepthCombo.IsEnabled = !opus;
+            ChannelsCombo.IsEnabled = !opus;
+            OpusFrameCombo.IsEnabled = opus;
         }
 
         private void StartWithWindowsCheckBox_Changed(object sender, RoutedEventArgs e)

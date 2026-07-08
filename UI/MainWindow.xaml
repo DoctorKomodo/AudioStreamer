@@ -26,6 +26,13 @@
                 <TextBlock Text="Sender Audio Buffer (ms)" Margin="1"/>
                 <TextBox x:Name="SenderAudioBufferTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
 
+                <TextBlock Text="Codec" Margin="1"/>
+                <ComboBox x:Name="CodecCombo" Width="200" Margin="1" HorizontalAlignment="Left"
+                          SelectionChanged="CodecCombo_SelectionChanged"/>
+
+                <TextBlock Text="Opus Frame Size" Margin="1"/>
+                <ComboBox x:Name="OpusFrameCombo" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
                 <TextBlock Text="Sample Rate" Margin="1"/>
                 <ComboBox x:Name="SampleRateCombo" Width="200" Margin="1" HorizontalAlignment="Left"/>
 
