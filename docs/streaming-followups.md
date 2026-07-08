@@ -254,12 +254,13 @@ and only then `Connect`. Trivial; do it alongside item 15.
 
 ## Wire protocol (current)
 
-Each UDP datagram: **2-byte header + raw PCM** (`WireProtocol`).
+Each UDP datagram: **3-byte header + audio payload** (raw PCM, or one Opus frame) (`WireProtocol`).
 - byte 0: format code — index into `AudioFormats.Formats` (72-entry catalog) (`WriteFormatCode`/`ReadFormatCode`; `AudioFormats.ToCode`/`FromCode`).
-- byte 1: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
-- byte 2+: audio payload, ≤ `MaxUdpAudioBytes` (1440), sliced on whole-frame boundaries.
+- byte 1: codec id — `public enum CodecId : byte { Pcm = 0, Opus = 1 }` (`WriteCodec`/`ReadCodec`), independent of the format catalog.
+- byte 2: wrapping sequence number (`SequenceLossTracker` → `lost/s` + `reorder/s`).
+- byte 3+: audio payload — PCM sliced on whole-frame boundaries, ≤ `MaxUdpAudioBytes` (1440); Opus is one encoded frame per datagram, size not signalled (the receiver's Opus decoder learns it from the first decode, for PLC).
 
-Both ends must run the same version (the catalog order is part of the contract).
+This grew from a 2-byte header (format code + sequence only) when Opus compression shipped, adding the codec byte. Both ends must run the same version (the catalog order and the codec id are both part of the contract) — this remains a breaking, same-build-on-both-sides wire change, as it was before the codec byte.
 
 ---
 
