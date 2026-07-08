@@ -42,6 +42,10 @@ namespace AudioStreamer
                 if (accumFill == accumulator.Length)
                 {
                     int len = encoder.Encode(accumulator, frameSamples, encodeBuffer, encodeBuffer.Length);
+                    // libopus returns a negative error code on failure; fail loud so the caller's try/catch
+                    // logs it rather than emitting a negative/garbage length.
+                    if (len < 0)
+                        throw new InvalidOperationException($"Opus encode failed with code {len}.");
                     emit(encodeBuffer, 0, len);   // Opus payload starts at 0 of its own encode buffer
                     accumFill = 0;
                 }
@@ -76,6 +80,10 @@ namespace AudioStreamer
         {
             Buffer.BlockCopy(packet, offset, inScratch, 0, count);
             int samples = decoder.Decode(inScratch, count, pcmOut, maxFrameSamples, false);
+            // libopus returns a negative error code on failure; fail loud so the caller's try/catch
+            // logs it rather than emitting a negative/garbage length.
+            if (samples < 0)
+                throw new InvalidOperationException($"Opus decode failed with code {samples}.");
             lastFrameSamples = samples;
             return samples * channels * 2;
         }
@@ -84,6 +92,10 @@ namespace AudioStreamer
         {
             // Null input packet => Opus PLC; frame size must match the stream (learned above).
             int samples = decoder.Decode((byte[]?)null, 0, pcmOut, lastFrameSamples, false);
+            // libopus returns a negative error code on failure; fail loud so the caller's try/catch
+            // logs it rather than emitting a negative/garbage length.
+            if (samples < 0)
+                throw new InvalidOperationException($"Opus decode failed with code {samples}.");
             return samples * channels * 2;
         }
 

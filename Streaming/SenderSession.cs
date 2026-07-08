@@ -6,9 +6,11 @@ using NAudio.Wave;
 namespace AudioStreamer
 {
     /// <summary>
-    /// Sender lifecycle: opens the UDP socket to HostName:Port and streams WASAPI loopback capture, slicing each
-    /// buffer into MTU-sized whole-frame datagrams. Self-heals when Windows invalidates the loopback stream
-    /// (lock screen / HDMI-monitor power-save / default-device change) by rebuilding the capture on a 1s poll.
+    /// Sender lifecycle: opens the UDP socket to HostName:Port and streams WASAPI loopback capture, routing each
+    /// captured buffer through the codec encoder (<see cref="IAudioEncoder"/>), which produces the wire datagrams
+    /// (MTU-sized slicing for PCM, frame accumulation + encode for Opus). Self-heals when Windows invalidates the
+    /// loopback stream (lock screen / HDMI-monitor power-save / default-device change) by rebuilding the capture
+    /// on a 1s poll.
     /// </summary>
     public sealed class SenderSession : IStreamSession
     {
