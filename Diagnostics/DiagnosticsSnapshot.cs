@@ -31,11 +31,13 @@ namespace AudioStreamer
             ? $"[recv] codec={CodecLabel} backlog={BacklogMs:F0}ms min={MinBacklogMs:F0}ms pkts/s={PacketsPerSec} KB/s={KbPerSec} lost/s={LostPerSec} reorder/s={ReorderPerSec} underrun/s={UnderrunPerSec} overflow/s={OverflowPerSec} resync/s={ResyncPerSec}"
             : $"[send] codec={CodecLabel} pkts/s={PacketsPerSec} KB/s={KbPerSec}";
 
-        /// <summary>Compact, vertically-stacked readout for the live UI (grouped: latency / wire order / buffer drift).</summary>
+        /// <summary>Compact, vertically-stacked readout for the live UI (codec / latency / wire order / buffer drift).</summary>
         public string ToCompactLine() => IsReceiver
-            ? $"codec {CodecLabel} · backlog {BacklogMs:F0} ms · min {MinBacklogMs:F0}\n"
+            ? $"codec {CodecLabel}\n"
+            + $"backlog {BacklogMs:F0} ms · min {MinBacklogMs:F0}\n"
             + $"{LostPerSec} lost/s · {ReorderPerSec} reorder/s\n"
             + $"{UnderrunPerSec} underrun/s · {ResyncPerSec} resync/s"
-            : $"codec {CodecLabel} · {PacketsPerSec} pkt/s · {KbPerSec} KB/s";
+            : $"codec {CodecLabel}\n"
+            + $"{PacketsPerSec} pkt/s · {KbPerSec} KB/s";
     }
 }

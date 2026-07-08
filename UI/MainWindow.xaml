@@ -52,6 +52,9 @@
 
                 <TextBlock Text="Receiver Max Latency (ms)" Margin="1"/>
                 <TextBox x:Name="ReceiverMaxLatencyTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
+
+                <TextBlock Text="Receiver Preroll (ms)" Margin="1"/>
+                <TextBox x:Name="ReceiverPrerollTextBox" Width="200" Margin="1" HorizontalAlignment="Left"/>
             </StackPanel>
 
         </StackPanel>

@@ -255,6 +255,7 @@ namespace AudioStreamer
             cfg.ReceiverAudioBufferMillisecondsLength = ParseOr(ReceiverAudioBufferTextBox.Text, cfg.ReceiverAudioBufferMillisecondsLength);
             cfg.ReceiverAudioLatencyMilliseconds = ParseOr(ReceiverAudioLatencyTextBox.Text, cfg.ReceiverAudioLatencyMilliseconds);
             cfg.ReceiverMaxLatencyMilliseconds = ParseOr(ReceiverMaxLatencyTextBox.Text, cfg.ReceiverMaxLatencyMilliseconds);
+            cfg.ReceiverPrerollMilliseconds = ParseOr(ReceiverPrerollTextBox.Text, cfg.ReceiverPrerollMilliseconds);
             cfg.SampleRate = SelectedValue(SampleRateCombo, cfg.SampleRate);
             cfg.BitsPerSample = SelectedValue(BitDepthCombo, cfg.BitsPerSample);
             cfg.Channels = SelectedValue(ChannelsCombo, cfg.Channels);
@@ -273,6 +274,7 @@ namespace AudioStreamer
             ReceiverAudioBufferTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverAudioBufferMillisecondsLength.ToString();
             ReceiverAudioLatencyTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverAudioLatencyMilliseconds.ToString();
             ReceiverMaxLatencyTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverMaxLatencyMilliseconds.ToString();
+            ReceiverPrerollTextBox.Text = audioStreamerLogic.CurrentConfig.ReceiverPrerollMilliseconds.ToString();
             SelectValue(SampleRateCombo, audioStreamerLogic.CurrentConfig.SampleRate, AudioFormats.DefaultSampleRate);
             SelectValue(BitDepthCombo, audioStreamerLogic.CurrentConfig.BitsPerSample, AudioFormats.DefaultBitDepth);
             SelectValue(ChannelsCombo, audioStreamerLogic.CurrentConfig.Channels, AudioFormats.AutoChannels);
