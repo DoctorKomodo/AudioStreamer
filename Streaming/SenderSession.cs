@@ -27,6 +27,7 @@ namespace AudioStreamer
         private volatile bool isRunning;
         private UdpClient? udpClient;
         private WasapiCapture? waveSource;
+        private IAudioEncoder? encoder;
 
         public SenderSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report, Action<bool> reportWaiting)
         {
@@ -96,7 +97,14 @@ namespace AudioStreamer
             // caller's lock on the RestartCapture path — accepted). MixFormat.Channels is what Auto matches.
             var renderInfo = TryGetDefaultRenderInfo();
             int nativeChannels = renderInfo?.Mix.Channels ?? AudioFormats.DefaultChannels;
-            int channels = AudioFormats.ResolveCaptureChannels(config.Channels, nativeChannels);
+
+            // Effective capture format. Opus is fixed to 48 kHz/16-bit/stereo; PCM uses the configured/Auto format.
+            // Do NOT write these back into config — switching to PCM must restore the user's stored values.
+            bool opus = config.Codec == CodecId.Opus;
+            int effRate = opus ? 48000 : config.SampleRate;
+            int effBits = opus ? 16 : config.BitsPerSample;
+            int effChannels = opus ? 2 : AudioFormats.ResolveCaptureChannels(config.Channels, nativeChannels);
+            int frameSamples = AudioStreamerLogic.ClampOpusFrameSamples(config.OpusFrameSamples);
 
             // The whole build+publish runs under senderLock so a concurrent Stop()/rebuild can't interleave with
             // the StartRecording()→waveSource hand-off. Reentrant when called from RestartCapture (which
@@ -107,24 +115,22 @@ namespace AudioStreamer
             {
                 capture = new TweakedWasapiLoopbackCapture(config.SenderAudioBufferMillisecondsLength)
                 {
-                    WaveFormat = AudioFormats.ToWaveFormat(config.SampleRate, config.BitsPerSample, channels)
+                    WaveFormat = AudioFormats.ToWaveFormat(effRate, effBits, effChannels)
                 };
 
-                // Slice each captured buffer into MTU-sized, whole-frame datagrams. Frame alignment matters: if a
-                // datagram is lost, dropping a whole number of frames leaves the stream aligned, whereas a partial
-                // frame would shift every subsequent sample (channel swap / noise) until the next resync.
-                int blockAlign = capture.WaveFormat.BlockAlign;
-                // Largest whole-frame slice that fits the MTU budget. Guard: if one frame ever exceeded MaxUdpAudioBytes
-                // (hundreds of channels — unreachable for normal PCM), this falls back to one frame per datagram, which
-                // re-allows IP fragmentation but is the only option since a frame can't be split.
-                int maxChunk = Math.Max(blockAlign, (WireProtocol.MaxUdpAudioBytes / blockAlign) * blockAlign);
+                var format = capture.WaveFormat;
+                // `encoder` is a field so StopCapture can dispose it. Dispose any prior encoder first so a
+                // device-flip rebuild (RestartCapture) doesn't leak the previous one. The encoder owns the
+                // MTU/whole-frame slicing (PcmEncoderAdapter) or Opus frame accumulation.
+                encoder?.Dispose();
+                encoder = CodecFactory.CreateEncoder(config.Codec, format, frameSamples, logLine);
 
                 // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
-                // dropout). The 1-byte format code is constant for the session, so write it once up front; the
-                // sequence byte at WireProtocol.SequenceByteOffset is overwritten per datagram. Byte 1 (the codec
-                // id) is left at its zero-initialized default = CodecId.Pcm for now.
-                byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + maxChunk];
-                WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(config.SampleRate, config.BitsPerSample, channels));
+                // dropout). The format code + codec id are constant for the session, so write them once up front;
+                // the sequence byte at WireProtocol.SequenceByteOffset is overwritten per datagram.
+                byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + WireProtocol.MaxUdpAudioBytes];
+                WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(effRate, effBits, effChannels));
+                WireProtocol.WriteCodec(sendBuffer, config.Codec);
 
                 var sendLogTimer = System.Diagnostics.Stopwatch.StartNew();
                 int sentPackets = 0;
@@ -135,21 +141,21 @@ namespace AudioStreamer
                 byte sequence = 0;
                 capture.DataAvailable += (sender, e) =>
                 {
-                    var socket = udpClient;   // read the field each callback so a Stop()/restart can't send on a closed socket
+                    var socket = udpClient;   // read per callback so a Stop()/restart can't send on a closed socket
                     if (socket == null)
                         return;
                     try
                     {
-                        for (int offset = 0; offset < e.BytesRecorded; offset += maxChunk)
+                        encoder.Push(e.Buffer, 0, e.BytesRecorded, (payload, off, len) =>
                         {
-                            int chunk = Math.Min(maxChunk, e.BytesRecorded - offset);
+                            var s = udpClient;
+                            if (s == null) return;
                             sendBuffer[WireProtocol.SequenceByteOffset] = sequence++;   // wraps at 256; receiver counts gaps as lost/reordered
-                            Buffer.BlockCopy(e.Buffer, offset, sendBuffer, WireProtocol.HeaderBytes, chunk);
-                            socket.Send(sendBuffer, chunk + WireProtocol.HeaderBytes);
-
+                            Buffer.BlockCopy(payload, off, sendBuffer, WireProtocol.HeaderBytes, len);
+                            s.Send(sendBuffer, len + WireProtocol.HeaderBytes);
                             sentPackets++;
-                            sentBytes += chunk + WireProtocol.HeaderBytes;
-                        }
+                            sentBytes += len + WireProtocol.HeaderBytes;
+                        });
 
                         if (sendLogTimer.ElapsedMilliseconds >= 1000)
                         {
@@ -276,6 +282,8 @@ namespace AudioStreamer
                 capture.RecordingStopped -= OnRecordingStopped;
                 try { capture.StopRecording(); } catch { /* already stopped by the OS */ }
                 capture.Dispose();
+                encoder?.Dispose();
+                encoder = null;
             }
         }
 
