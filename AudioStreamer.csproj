@@ -10,15 +10,22 @@
     <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
     <!-- Single source of truth for the app version. The installer reads this back
          from the built exe; build-installer.ps1 -Version can override it at build time. -->
-    <Version>1.2.2.0</Version>
+    <Version>1.3.0.0</Version>
     <Authors>AudioStreamer</Authors>
     <Description>Streams system audio between two machines over UDP on a LAN</Description>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- WASAPI capture/playback is all this app uses. The NAudio meta-package also drags in
          Midi/Asio/WinMM/WinForms assemblies we never touch; NAudio.Wasapi pulls only NAudio.Core. -->
     <PackageReference Include="NAudio.Wasapi" Version="2.3.0" />
+    <!-- Native libopus binding. Core = managed wrapper; OpusSharp.Natives is the only native
+         package and carries every RID (android/ios/linux/osx/win/wasm). There is no win-x64-only
+         variant, so build-installer.ps1 publishes with -r win-x64 to ship just opus.dll and drop
+         the ~14 MB of foreign-platform natives. RuntimeIdentifiers (below) makes that restore clean. -->
+    <PackageReference Include="OpusSharp.Core" Version="1.6.1.4" />
+    <PackageReference Include="OpusSharp.Natives" Version="1.6.1.4" />
     <!-- Config is (de)serialized with the runtime's built-in System.Text.Json — no extra package. -->
   </ItemGroup>
 

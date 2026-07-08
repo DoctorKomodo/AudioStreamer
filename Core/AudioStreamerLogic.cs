@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Text.Json;
 
@@ -19,11 +20,20 @@ namespace AudioStreamer
             public int ReceiverAudioBufferMillisecondsLength { get; set; } = 1000;
             public int ReceiverAudioLatencyMilliseconds { get; set; } = 20;
             public int ReceiverMaxLatencyMilliseconds { get; set; } = 150;   // drift cap; trims backlog to half this. 150 keeps lip-sync tight while leaving jitter headroom (400 was too laggy in the field)
+            // Audio pre-buffered (as silence) before playback starts, giving a cushion so normal clock drift /
+            // render-thread jitter doesn't drain the buffer to empty (an underrun blip). Higher = fewer blips but
+            // more latency; clamped to at most ReceiverMaxLatencyMilliseconds (keep it comfortably below the cap
+            // so upward drift has room to stack on the cushion before the drift cap starts trimming).
+            public int ReceiverPrerollMilliseconds { get; set; } = 60;
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;
             // 0 == AudioFormats.AutoChannels: match the render endpoint's mix-format channel count. Existing
             // config.json files keep their stored explicit value (LoadConfig only adds missing fields).
             public int Channels { get; set; } = 0;
+            public CodecId Codec { get; set; } = CodecId.Pcm;
+            // Opus frame size in samples/channel at 48 kHz (480 = 10 ms). Valid: 120/240/480/960 (2.5/5/10/20 ms).
+            // Stored as samples (libopus's frame_size arg) to avoid a fractional-ms field for 2.5 ms.
+            public int OpusFrameSamples { get; set; } = 480;
             public bool StartMinimized { get; set; } = false;   // first run shows the window so it can be configured before starting
         }
 
@@ -123,6 +133,18 @@ namespace AudioStreamer
         public void SaveConfig()
         {
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(CurrentConfig, JsonOptions));
+        }
+
+        public static readonly int[] OpusFrameSizes = { 120, 240, 480, 960 };   // 2.5/5/10/20 ms @ 48 kHz
+
+        /// <summary>Snaps a (possibly hand-edited) frame size to the nearest valid option.</summary>
+        public static int ClampOpusFrameSamples(int value)
+        {
+            int best = OpusFrameSizes[0];
+            foreach (int v in OpusFrameSizes)
+                if (Math.Abs(v - value) < Math.Abs(best - value))
+                    best = v;
+            return best;
         }
     }
 }

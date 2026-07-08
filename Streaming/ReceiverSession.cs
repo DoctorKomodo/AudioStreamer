@@ -16,6 +16,11 @@ namespace AudioStreamer
         private const int ReorderMaxWindowPackets = 64;
         private const int ReorderBaselineBytesPerSecond = 48000 * 2 * 2;   // 192000 B/s (16-bit stereo @ 48 kHz)
 
+        // Opus datagrams arrive at the frame rate (100/s at 10 ms), not the PCM MTU cadence, so the PCM
+        // byte-rate window formula mis-sizes them (8 packets = 160 ms at 20 ms frames, past the drift cap).
+        // A fixed small count keeps give-up time bounded (10-80 ms across 2.5-20 ms frames), always < the cap.
+        private const int OpusReorderWindowPackets = 4;
+
         /// <summary>Reorder-buffer depth scaled to the stream's byte rate, keeping give-up time ~constant (~40 ms).</summary>
         public static int ComputeReorderWindow(WaveFormat format) =>
             Math.Clamp(ReorderBaseWindowPackets * format.AverageBytesPerSecond / ReorderBaselineBytesPerSecond,
@@ -25,7 +30,7 @@ namespace AudioStreamer
         private readonly Action<string> logLine;
         private readonly Action<DiagnosticsSnapshot> report;
 
-        // Serializes WasapiOut build / teardown / rebuild (Task 5) against Stop().
+        // Serializes WasapiOut build / teardown / rebuild against Stop().
         private readonly object outputLock = new();
 
         private UdpClient? udpClient;
@@ -34,6 +39,7 @@ namespace AudioStreamer
         private BufferedWaveProvider bufferedWaveProvider = null!;   // built once the first packet reveals the format
         private UnderrunCountingWaveProvider? underrunMeter;
         private CancellationTokenSource? cts;
+        private Task? receiveLoop;   // the InitializeReceiver/ReceiveAudio task; joined in Stop() before decoder.Dispose()
         private volatile bool isRunning;
 
         // Diagnostics + latency-cap state, shared across the receive loop iterations (were captured locals).
@@ -43,10 +49,20 @@ namespace AudioStreamer
         private long payloadBytes;
         private double minBacklogMs = double.MaxValue;
         private int maxLatencyMs;
+        private int prerollMs;   // silence pre-buffered before playback (drift/jitter cushion); clamped in Start()
+        // Underrun diagnostics: a session total and the gap between blips, so the log shows how far apart the
+        // drift/jitter underruns actually are (the per-second underrun/s tick alone is easy to miss).
+        private int totalUnderruns;
+        private readonly System.Diagnostics.Stopwatch underrunGapTimer = new();
 
         // The active wire format code, set in BuildPipeline. The receive loop rebuilds when an incoming code differs.
         private byte currentFormatCode;
-        // Log-once guard for an unknown code seen mid-stream (the InitializeReceiver guard's flag is a local there).
+        private CodecId currentCodec;
+        private IAudioDecoder decoder = null!;   // built alongside the pipeline
+        private byte[] pcmScratch = System.Array.Empty<byte>();   // decode/conceal output, sized for the largest frame
+        // Log-once guard for a mid-stream datagram the pipeline can't use: either an unknown format code, or a
+        // valid-catalog code whose codec rejects the format (e.g. Opus-incompatible sample rate/channels) and
+        // throws out of BuildPipeline. (The InitializeReceiver guard's equivalent flag is a local there.)
         private bool loggedBadFormatMidStream;
 
         public ReceiverSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report)
@@ -61,6 +77,12 @@ namespace AudioStreamer
         public void Start()
         {
             maxLatencyMs = config.ReceiverMaxLatencyMilliseconds;
+            // Clamp the preroll to at most the drift cap. (Keeping it comfortably below the cap is best — that
+            // leaves room for upward drift to stack on the cushion before TrimBacklog starts trimming.)
+            prerollMs = Math.Max(0, maxLatencyMs > 0
+                ? Math.Min(config.ReceiverPrerollMilliseconds, maxLatencyMs)
+                : config.ReceiverPrerollMilliseconds);
+            underrunGapTimer.Restart();
             var client = new UdpClient(config.Port);
             client.Client.ReceiveBufferSize = WireProtocol.SocketBufferBytes;
             client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);
@@ -69,7 +91,9 @@ namespace AudioStreamer
             cts = new CancellationTokenSource();
             isRunning = true;
             logTimer.Restart();
-            Task.Run(InitializeReceiver, cts.Token);
+            // Captured so Stop() can join this before disposing the decoder — InitializeReceiver now runs
+            // ReceiveAudio inline (see there), so this one task spans the whole receive-loop lifetime.
+            receiveLoop = Task.Run(InitializeReceiver, cts.Token);
             logLine("Receiving audio...");
         }
 
@@ -88,25 +112,42 @@ namespace AudioStreamer
                     output.Dispose();
                 }
             }
-            udpClient?.Close();
+            udpClient?.Close();            // unblocks the blocking ReceiveFrom so the receive loop observes the cancelled token and exits
             udpClient = null;
             socket = null;
+            // Join the receive loop before touching the decoder: it calls decoder.Decode/Conceal from inside the
+            // ReorderBuffer callbacks, and freeing the native Opus decoder while a decode is in flight is a
+            // use-after-free (crash risk), not just a race. The socket close above is what makes ReceiveFrom return
+            // promptly, so this wait should be near-instant in the normal case; the bounded timeout is only a
+            // defense against a pathologically stuck loop so Stop() can't hang the caller (e.g. the UI thread)
+            // forever — the decoder is disposed regardless once the wait completes or times out.
+            try { receiveLoop?.Wait(TimeSpan.FromSeconds(2)); }
+            catch (AggregateException) { /* receive loop threw on teardown (socket closed) — expected */ }
+            receiveLoop = null;
             cts?.Dispose();
             cts = null;
+            decoder?.Dispose();
+            decoder = null!;
         }
 
         // Builds (or rebuilds) WasapiOut around the existing underrun meter and starts playback. Single source of
-        // truth for output creation so the recovery loop (Task 5) reuses it. Flushes to the live edge first so a
+        // truth for output creation so the device-recovery loop reuses it. Flushes to the live edge first so a
         // rebuild after a device outage resumes at ~0 backlog rather than dumping the piled-up backlog at once.
         // Constructed here (background thread) so WasapiOut captures no SynchronizationContext and PlaybackStopped
-        // (Task 5) fires off the UI thread.
-        private void BuildAndPlayOutput()
+        // fires off the UI thread.
+        //
+        // preroll: when true, pre-fill the buffer with prerollMs of silence before Play() so playback starts with
+        // a cushion (WasapiOut drains the silence while real audio queues behind it, establishing a ~prerollMs
+        // backlog) — this is what keeps normal clock drift/jitter from bottoming the buffer out. Only the caller on
+        // the receive thread (BuildPipeline) passes true; the device-recovery caller (RestartOutput, a background
+        // thread) passes false so we never AddSamples off the receive thread (the buffer is single-writer).
+        private void BuildAndPlayOutput(bool preroll)
         {
             lock (outputLock)
             {
                 // Re-check isRunning INSIDE the lock so this build is atomic against Stop(), which also takes
                 // outputLock. This is the receiver mirror of the sender's senderLock-atomic IsRunning+StartCapture
-                // pair: without it, a Stop() racing a recovery rebuild (Task 5) could resurrect a live WasapiOut
+                // pair: without it, a Stop() racing a recovery rebuild could resurrect a live WasapiOut
                 // after the session stopped, leaking a playing device. On the first build (from InitializeReceiver)
                 // isRunning is already true, so this passes.
                 if (!isRunning)
@@ -119,6 +160,19 @@ namespace AudioStreamer
                     wasapiOut = null;
                 }
                 bufferedWaveProvider.ClearBuffer();   // no-op on first build (buffer empty); live-edge flush on rebuild
+                if (preroll && prerollMs > 0)
+                {
+                    var fmt = bufferedWaveProvider.WaveFormat;
+                    // (long) intermediate: AverageBytesPerSecond can be ~6 MB/s (192 kHz/32-bit/8ch) and a
+                    // hand-edited preroll could be large enough to overflow a 32-bit multiply.
+                    int silenceBytes = (int)((long)fmt.AverageBytesPerSecond * prerollMs / 1000);
+                    silenceBytes -= silenceBytes % fmt.BlockAlign;   // whole frames only
+                    if (silenceBytes > 0)
+                    {
+                        bufferedWaveProvider.AddSamples(new byte[silenceBytes], 0, silenceBytes);
+                        logLine($"Preroll: buffered {prerollMs} ms of silence before playback (drift/jitter cushion).");
+                    }
+                }
                 var output = new WasapiOut(AudioClientShareMode.Shared, config.ReceiverAudioLatencyMilliseconds);
                 output.Init(underrunMeter);
                 output.PlaybackStopped += OnPlaybackStopped;
@@ -164,7 +218,7 @@ namespace AudioStreamer
                     try
                     {
                         if (!isRunning || token.IsCancellationRequested) return;
-                        BuildAndPlayOutput();
+                        BuildAndPlayOutput(preroll: false);   // background thread — must not write to the single-writer buffer
                         logLine("Receiver output restarted.");
                         return;
                     }
@@ -186,17 +240,34 @@ namespace AudioStreamer
         // channel count under Auto). The buffer/meter field swap here is safe because the receive loop is
         // single-threaded (the only thread that touches those fields and calls AddSamples); only the WasapiOut
         // create/teardown inside BuildAndPlayOutput is serialized by outputLock (against Stop() / PlaybackStopped
-        // recovery). Set the fields BEFORE BuildAndPlayOutput so the new WasapiOut is wired to the new buffer.
-        private void BuildPipeline(AudioFormats.Format fmt, byte code)
+        // recovery).
+        //
+        // Transactional: CreateDecoder can THROW for a valid-catalog-but-codec-incompatible format (e.g. Opus with
+        // a sample rate/channel count OpusDecoder rejects) — a foreign/corrupt datagram can reach here with a code
+        // that passes AudioFormats.FromCode but isn't Opus-compatible. Nothing externally observable (currentFormatCode,
+        // currentCodec, the old decoder) is mutated until CreateDecoder succeeds, so a throw here leaves the existing
+        // pipeline fully intact instead of committing to a format whose decoder never got built (which would leave
+        // `decoder` disposed/stale and every subsequent matching datagram decoding on a dead handle).
+        private void BuildPipeline(AudioFormats.Format fmt, byte code, CodecId codec)
         {
+            var waveFormat = AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels);
+            var newDecoder = CodecFactory.CreateDecoder(codec, waveFormat, logLine);   // may throw; nothing committed yet
+
+            // Commit: everything below only runs once the new decoder exists.
             currentFormatCode = code;
-            bufferedWaveProvider = new BufferedWaveProvider(AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
+            currentCodec = codec;
+            decoder?.Dispose();
+            decoder = newDecoder;
+            bufferedWaveProvider = new BufferedWaveProvider(waveFormat)
             {
                 BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
                 DiscardOnBufferOverflow = true
             };
             underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
-            BuildAndPlayOutput();
+            // Largest supported Opus frame (20 ms) worth of PCM, sized generously; PCM decode writes <= one datagram.
+            int maxFrameBytes = waveFormat.SampleRate / 50 * waveFormat.Channels * (waveFormat.BitsPerSample / 8);
+            pcmScratch = new byte[System.Math.Max(maxFrameBytes, WireProtocol.MaxUdpAudioBytes)];
+            BuildAndPlayOutput(preroll: true);   // receive thread — safe to pre-fill the buffer with silence
         }
 
         // ReorderBuffer emit target. Reads the bufferedWaveProvider field live, so a rebuild that swaps the field
@@ -207,6 +278,22 @@ namespace AudioStreamer
                 overflows++;
             bufferedWaveProvider.AddSamples(buf, off, cnt);
         }
+
+        // Builds a ReorderBuffer whose emit decodes the payload through the active decoder into pcmScratch before
+        // EmitSamples, and whose onLost runs the decoder's concealment (Opus PLC; PCM returns 0 → nothing emitted).
+        // Reads the decoder/pcmScratch fields live, so a mid-stream rebuild re-points them without new delegates.
+        private ReorderBuffer MakeReorderBuffer(int window) => new ReorderBuffer(
+            window,
+            emit: (buf, off, cnt) =>
+            {
+                int bytes = decoder.Decode(buf, off, cnt, pcmScratch);
+                EmitSamples(pcmScratch, 0, bytes);
+            },
+            onLost: () =>
+            {
+                int bytes = decoder.Conceal(pcmScratch);   // Opus PLC; PCM returns 0
+                if (bytes > 0) EmitSamples(pcmScratch, 0, bytes);
+            });
 
         private void InitializeReceiver()
         {
@@ -239,8 +326,31 @@ namespace AudioStreamer
                             continue;
                         }
                         logLine($"Sample rate: {fmt.SampleRate}, Bit depth: {fmt.BitDepth}, Channels: {fmt.Channels} received from sender");
-                        BuildPipeline(fmt, code);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
-                        Task.Run(ReceiveAudio, token);
+                        CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
+                        logLine($"Codec: {codec}");
+                        BuildPipeline(fmt, code, codec);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
+
+                        // Flush datagrams that queued in the socket buffer while BuildPipeline activated the
+                        // WasapiOut render device (activation can take tens of ms). Discarding them lets playback
+                        // start at the live edge + preroll, so a receiver restart resumes with the same backlog as
+                        // a sender restart instead of carrying that one-time startup burst as extra latency. Only
+                        // packets already sitting in the socket are dropped (Available>0 => ReceiveFrom won't block);
+                        // the preroll silence covers the gap until the next live datagram.
+                        int flushed = 0;
+                        while (socket.Available > 0)
+                        {
+                            socket.ReceiveFrom(receiveBuffer, ref remoteEP);
+                            flushed++;
+                        }
+                        if (flushed > 0)
+                            logLine($"Flushed {flushed} datagram(s) queued during startup; starting at the live edge.");
+
+                        // Call inline rather than a nested Task.Run: this method already runs on its own background
+                        // thread (Start()'s Task.Run), and ReceiveAudio is the long-lived steady-state loop that
+                        // touches the decoder. Running it inline keeps the whole handshake+streaming lifetime under
+                        // the single task Start() captures into receiveLoop, so Stop() can join it and be sure no
+                        // decode is in flight before disposing the decoder.
+                        ReceiveAudio();
                         break;
                     }
                 }
@@ -260,9 +370,11 @@ namespace AudioStreamer
             var token = cts!.Token;
             Socket socket = this.socket!;   // captured once; see InitializeReceiver for why (Stop() nulls the field)
 
-            int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+            int reorderWindow = currentCodec == CodecId.Opus
+                ? OpusReorderWindowPackets
+                : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
             logLine($"Reorder window: {reorderWindow} packets");
-            var reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
+            var reorderBuffer = MakeReorderBuffer(reorderWindow);
 
             while (!token.IsCancellationRequested)
             {
@@ -272,7 +384,8 @@ namespace AudioStreamer
                     if (received > WireProtocol.HeaderBytes)
                     {
                         byte code = WireProtocol.ReadFormatCode(receiveBuffer);
-                        if (code != currentFormatCode)
+                        CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
+                        if (code != currentFormatCode || codec != currentCodec)
                         {
                             if (AudioFormats.FromCode(code) is not { } newFmt)
                             {
@@ -286,13 +399,30 @@ namespace AudioStreamer
                                 continue;
                             }
 
-                            // Valid new format: rebuild the whole pipeline BEFORE feeding this datagram, so no
+                            // Valid new format or codec: rebuild the whole pipeline BEFORE feeding this datagram, so no
                             // old-format-aligned bytes land in the new buffer. Single-threaded loop => atomic vs AddSamples.
-                            logLine($"Wire format changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch; rebuilding output.");
-                            BuildPipeline(newFmt, code);
-                            reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
-                            reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
-                            logLine($"Reorder window: {reorderWindow} packets");
+                            // BuildPipeline can still throw (e.g. a valid-catalog-but-Opus-incompatible format/codec
+                            // combo from a foreign/corrupt datagram) — it's now transactional, so a throw here leaves
+                            // the existing pipeline untouched; skip the rebuild and keep streaming on the old format.
+                            try
+                            {
+                                logLine($"Wire format/codec changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec}; rebuilding.");
+                                BuildPipeline(newFmt, code, codec);
+                                reorderWindow = codec == CodecId.Opus
+                                    ? OpusReorderWindowPackets
+                                    : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                                reorderBuffer = MakeReorderBuffer(reorderWindow);
+                                logLine($"Reorder window: {reorderWindow} packets");
+                            }
+                            catch (Exception ex)
+                            {
+                                if (!loggedBadFormatMidStream)
+                                {
+                                    logLine($"Ignoring mid-stream datagram: failed to rebuild pipeline for {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec} ({ex.Message}).");
+                                    loggedBadFormatMidStream = true;
+                                }
+                                continue;
+                            }
                         }
 
                         int payload = received - WireProtocol.HeaderBytes;
@@ -301,6 +431,17 @@ namespace AudioStreamer
 
                         double backlogNow = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
                         if (backlogNow < minBacklogMs) minBacklogMs = backlogNow;
+
+                        // Resume-from-starvation: if the buffer has fully drained (sender restart / long gap, or a
+                        // drift underrun), refill the cushion with silence BEFORE feeding this packet — so playback
+                        // holds silence until the cushion is buffered and then resumes clean, instead of trickling at
+                        // the live edge and blipping when the cushion is topped up later. BufferedBytes == 0 is the
+                        // exact "we starved" signal: WasapiOut can only drain the buffer, so once it hits empty it
+                        // stays empty until we add here — it never reads 0 in healthy cushioned playback (min > 0),
+                        // so this can't false-fire on a normal dip into the cushion. RecushionToPreroll only tops up
+                        // the deficit to prerollMs, so repeated calls during a ramp can't over-fill.
+                        if (prerollMs > 0 && bufferedWaveProvider.BufferedBytes == 0)
+                            RecushionToPreroll();
 
                         sequenceTracker.OnReceived(receiveBuffer[WireProtocol.SequenceByteOffset]);
                         reorderBuffer.Add(receiveBuffer[WireProtocol.SequenceByteOffset], receiveBuffer, WireProtocol.HeaderBytes, payload);
@@ -336,16 +477,42 @@ namespace AudioStreamer
             resyncs++;
         }
 
+        // Low-water mirror of TrimBacklog, called from the receive loop the moment the buffer is found drained
+        // (BufferedBytes == 0): top it back up to the preroll cushion with silence so playback doesn't resume at
+        // the fragile live edge (min ~0), where drift underruns return. Only the deficit is added, capped at
+        // prerollMs (<= the drift cap, so TrimBacklog won't immediately trim it, and repeated calls can't over-fill).
+        // Runs on the receive thread (single-writer).
+        private void RecushionToPreroll()
+        {
+            var fmt = bufferedWaveProvider.WaveFormat;
+            int targetBytes = (int)((long)fmt.AverageBytesPerSecond * prerollMs / 1000);
+            int addBytes = targetBytes - bufferedWaveProvider.BufferedBytes;
+            addBytes -= addBytes % fmt.BlockAlign;   // whole frames only
+            if (addBytes <= 0)
+                return;   // already at/above the cushion (e.g. it refilled on its own) — nothing to do
+            bufferedWaveProvider.AddSamples(new byte[addBytes], 0, addBytes);
+            long addedMs = (long)addBytes * 1000 / fmt.AverageBytesPerSecond;
+            logLine($"Re-cushioned {addedMs} ms of silence after buffer starvation (restoring the {prerollMs} ms preroll).");
+        }
+
         private void ReportInterval()
         {
             double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
             // MUST NOT SWAP: Exchange() returns (Reorders, Losses) but ForReceiver wants (..., lostPerSec, reorderPerSec, ...).
             // So the call below passes `losses, reorders` in that order — same as the original (source line 463). Do not "tidy".
             var (reorders, losses) = sequenceTracker.Exchange();
+            int underruns = underrunMeter?.ExchangeUnderruns() ?? 0;
+            if (underruns > 0)
+            {
+                totalUnderruns += underruns;
+                logLine($"Underrun blip: {underruns} this interval, {totalUnderruns} total this session; " +
+                        $"{underrunGapTimer.Elapsed.TotalSeconds:F0}s since the previous underrun.");
+                underrunGapTimer.Restart();
+            }
             report(DiagnosticsSnapshot.ForReceiver(
                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
                 packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
-                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
+                underruns, minBacklog, currentCodec));
             packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
             minBacklogMs = double.MaxValue;
             logTimer.Restart();
