@@ -39,6 +39,7 @@ namespace AudioStreamer
         private BufferedWaveProvider bufferedWaveProvider = null!;   // built once the first packet reveals the format
         private UnderrunCountingWaveProvider? underrunMeter;
         private CancellationTokenSource? cts;
+        private Task? receiveLoop;   // the InitializeReceiver/ReceiveAudio task; joined in Stop() before decoder.Dispose()
         private volatile bool isRunning;
 
         // Diagnostics + latency-cap state, shared across the receive loop iterations (were captured locals).
@@ -77,7 +78,9 @@ namespace AudioStreamer
             cts = new CancellationTokenSource();
             isRunning = true;
             logTimer.Restart();
-            Task.Run(InitializeReceiver, cts.Token);
+            // Captured so Stop() can join this before disposing the decoder — InitializeReceiver now runs
+            // ReceiveAudio inline (see there), so this one task spans the whole receive-loop lifetime.
+            receiveLoop = Task.Run(InitializeReceiver, cts.Token);
             logLine("Receiving audio...");
         }
 
@@ -96,9 +99,18 @@ namespace AudioStreamer
                     output.Dispose();
                 }
             }
-            udpClient?.Close();
+            udpClient?.Close();            // unblocks the blocking ReceiveFrom so the receive loop observes the cancelled token and exits
             udpClient = null;
             socket = null;
+            // Join the receive loop before touching the decoder: it calls decoder.Decode/Conceal from inside the
+            // ReorderBuffer callbacks, and freeing the native Opus decoder while a decode is in flight is a
+            // use-after-free (crash risk), not just a race. The socket close above is what makes ReceiveFrom return
+            // promptly, so this wait should be near-instant in the normal case; the bounded timeout is only a
+            // defense against a pathologically stuck loop so Stop() can't hang the caller (e.g. the UI thread)
+            // forever — the decoder is disposed regardless once the wait completes or times out.
+            try { receiveLoop?.Wait(TimeSpan.FromSeconds(2)); }
+            catch (AggregateException) { /* receive loop threw on teardown (socket closed) — expected */ }
+            receiveLoop = null;
             cts?.Dispose();
             cts = null;
             decoder?.Dispose();
@@ -275,7 +287,12 @@ namespace AudioStreamer
                         CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
                         logLine($"Codec: {codec}");
                         BuildPipeline(fmt, code, codec);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
-                        Task.Run(ReceiveAudio, token);
+                        // Call inline rather than a nested Task.Run: this method already runs on its own background
+                        // thread (Start()'s Task.Run), and ReceiveAudio is the long-lived steady-state loop that
+                        // touches the decoder. Running it inline keeps the whole handshake+streaming lifetime under
+                        // the single task Start() captures into receiveLoop, so Stop() can join it and be sure no
+                        // decode is in flight before disposing the decoder.
+                        ReceiveAudio();
                         break;
                     }
                 }
