@@ -25,7 +25,7 @@ namespace AudioStreamer
         private readonly Action<string> logLine;
         private readonly Action<DiagnosticsSnapshot> report;
 
-        // Serializes WasapiOut build / teardown / rebuild (Task 5) against Stop().
+        // Serializes WasapiOut build / teardown / rebuild against Stop().
         private readonly object outputLock = new();
 
         private UdpClient? udpClient;
@@ -96,17 +96,17 @@ namespace AudioStreamer
         }
 
         // Builds (or rebuilds) WasapiOut around the existing underrun meter and starts playback. Single source of
-        // truth for output creation so the recovery loop (Task 5) reuses it. Flushes to the live edge first so a
+        // truth for output creation so the device-recovery loop reuses it. Flushes to the live edge first so a
         // rebuild after a device outage resumes at ~0 backlog rather than dumping the piled-up backlog at once.
         // Constructed here (background thread) so WasapiOut captures no SynchronizationContext and PlaybackStopped
-        // (Task 5) fires off the UI thread.
+        // fires off the UI thread.
         private void BuildAndPlayOutput()
         {
             lock (outputLock)
             {
                 // Re-check isRunning INSIDE the lock so this build is atomic against Stop(), which also takes
                 // outputLock. This is the receiver mirror of the sender's senderLock-atomic IsRunning+StartCapture
-                // pair: without it, a Stop() racing a recovery rebuild (Task 5) could resurrect a live WasapiOut
+                // pair: without it, a Stop() racing a recovery rebuild could resurrect a live WasapiOut
                 // after the session stopped, leaking a playing device. On the first build (from InitializeReceiver)
                 // isRunning is already true, so this passes.
                 if (!isRunning)

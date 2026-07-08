@@ -3,7 +3,7 @@ using NAudio.Wave;
 
 namespace AudioStreamer
 {
-    /// <summary>Maps a CodecId + PCM format to an encoder/decoder. Opus branch added in Task 5.</summary>
+    /// <summary>Maps a CodecId + PCM format to the matching encoder/decoder (identity PCM or Opus).</summary>
     internal static class CodecFactory
     {
         public static IAudioEncoder CreateEncoder(CodecId codec, WaveFormat format, int opusFrameSamples, Action<string> log)
