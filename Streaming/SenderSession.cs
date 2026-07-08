@@ -161,7 +161,7 @@ namespace AudioStreamer
 
                         if (sendLogTimer.ElapsedMilliseconds >= 1000)
                         {
-                            report(DiagnosticsSnapshot.ForSender(sentPackets, sentBytes / 1024));
+                            report(DiagnosticsSnapshot.ForSender(sentPackets, sentBytes / 1024, config.Codec));
                             sentPackets = 0; sentBytes = 0; sendLogTimer.Restart();
                         }
                     }

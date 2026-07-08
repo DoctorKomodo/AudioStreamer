@@ -429,7 +429,7 @@ namespace AudioStreamer
             report(DiagnosticsSnapshot.ForReceiver(
                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
                 packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
-                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog));
+                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog, currentCodec));
             packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
             minBacklogMs = double.MaxValue;
             logTimer.Restart();
