@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Text.Json;
 
@@ -24,6 +25,10 @@ namespace AudioStreamer
             // 0 == AudioFormats.AutoChannels: match the render endpoint's mix-format channel count. Existing
             // config.json files keep their stored explicit value (LoadConfig only adds missing fields).
             public int Channels { get; set; } = 0;
+            public CodecId Codec { get; set; } = CodecId.Pcm;
+            // Opus frame size in samples/channel at 48 kHz (480 = 10 ms). Valid: 120/240/480/960 (2.5/5/10/20 ms).
+            // Stored as samples (libopus's frame_size arg) to avoid a fractional-ms field for 2.5 ms.
+            public int OpusFrameSamples { get; set; } = 480;
             public bool StartMinimized { get; set; } = false;   // first run shows the window so it can be configured before starting
         }
 
@@ -123,6 +128,18 @@ namespace AudioStreamer
         public void SaveConfig()
         {
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(CurrentConfig, JsonOptions));
+        }
+
+        public static readonly int[] OpusFrameSizes = { 120, 240, 480, 960 };   // 2.5/5/10/20 ms @ 48 kHz
+
+        /// <summary>Snaps a (possibly hand-edited) frame size to the nearest valid option.</summary>
+        public static int ClampOpusFrameSamples(int value)
+        {
+            int best = OpusFrameSizes[0];
+            foreach (int v in OpusFrameSizes)
+                if (Math.Abs(v - value) < Math.Abs(best - value))
+                    best = v;
+            return best;
         }
     }
 }
