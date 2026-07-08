@@ -55,7 +55,9 @@ namespace AudioStreamer
         private CodecId currentCodec;
         private IAudioDecoder decoder = null!;   // built alongside the pipeline
         private byte[] pcmScratch = System.Array.Empty<byte>();   // decode/conceal output, sized for the largest frame
-        // Log-once guard for an unknown code seen mid-stream (the InitializeReceiver guard's flag is a local there).
+        // Log-once guard for a mid-stream datagram the pipeline can't use: either an unknown format code, or a
+        // valid-catalog code whose codec rejects the format (e.g. Opus-incompatible sample rate/channels) and
+        // throws out of BuildPipeline. (The InitializeReceiver guard's equivalent flag is a local there.)
         private bool loggedBadFormatMidStream;
 
         public ReceiverSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report)
@@ -208,20 +210,30 @@ namespace AudioStreamer
         // channel count under Auto). The buffer/meter field swap here is safe because the receive loop is
         // single-threaded (the only thread that touches those fields and calls AddSamples); only the WasapiOut
         // create/teardown inside BuildAndPlayOutput is serialized by outputLock (against Stop() / PlaybackStopped
-        // recovery). Set the fields BEFORE BuildAndPlayOutput so the new WasapiOut is wired to the new buffer.
+        // recovery).
+        //
+        // Transactional: CreateDecoder can THROW for a valid-catalog-but-codec-incompatible format (e.g. Opus with
+        // a sample rate/channel count OpusDecoder rejects) — a foreign/corrupt datagram can reach here with a code
+        // that passes AudioFormats.FromCode but isn't Opus-compatible. Nothing externally observable (currentFormatCode,
+        // currentCodec, the old decoder) is mutated until CreateDecoder succeeds, so a throw here leaves the existing
+        // pipeline fully intact instead of committing to a format whose decoder never got built (which would leave
+        // `decoder` disposed/stale and every subsequent matching datagram decoding on a dead handle).
         private void BuildPipeline(AudioFormats.Format fmt, byte code, CodecId codec)
         {
+            var waveFormat = AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels);
+            var newDecoder = CodecFactory.CreateDecoder(codec, waveFormat, logLine);   // may throw; nothing committed yet
+
+            // Commit: everything below only runs once the new decoder exists.
             currentFormatCode = code;
             currentCodec = codec;
-            var waveFormat = AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels);
+            decoder?.Dispose();
+            decoder = newDecoder;
             bufferedWaveProvider = new BufferedWaveProvider(waveFormat)
             {
                 BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
                 DiscardOnBufferOverflow = true
             };
             underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
-            decoder?.Dispose();
-            decoder = CodecFactory.CreateDecoder(codec, waveFormat, logLine);
             // Largest supported Opus frame (20 ms) worth of PCM, sized generously; PCM decode writes <= one datagram.
             int maxFrameBytes = waveFormat.SampleRate / 50 * waveFormat.Channels * (waveFormat.BitsPerSample / 8);
             pcmScratch = new byte[System.Math.Max(maxFrameBytes, WireProtocol.MaxUdpAudioBytes)];
@@ -343,13 +355,28 @@ namespace AudioStreamer
 
                             // Valid new format or codec: rebuild the whole pipeline BEFORE feeding this datagram, so no
                             // old-format-aligned bytes land in the new buffer. Single-threaded loop => atomic vs AddSamples.
-                            logLine($"Wire format/codec changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec}; rebuilding.");
-                            BuildPipeline(newFmt, code, codec);
-                            reorderWindow = codec == CodecId.Opus
-                                ? OpusReorderWindowPackets
-                                : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
-                            reorderBuffer = MakeReorderBuffer(reorderWindow);
-                            logLine($"Reorder window: {reorderWindow} packets");
+                            // BuildPipeline can still throw (e.g. a valid-catalog-but-Opus-incompatible format/codec
+                            // combo from a foreign/corrupt datagram) — it's now transactional, so a throw here leaves
+                            // the existing pipeline untouched; skip the rebuild and keep streaming on the old format.
+                            try
+                            {
+                                logLine($"Wire format/codec changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec}; rebuilding.");
+                                BuildPipeline(newFmt, code, codec);
+                                reorderWindow = codec == CodecId.Opus
+                                    ? OpusReorderWindowPackets
+                                    : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                                reorderBuffer = MakeReorderBuffer(reorderWindow);
+                                logLine($"Reorder window: {reorderWindow} packets");
+                            }
+                            catch (Exception ex)
+                            {
+                                if (!loggedBadFormatMidStream)
+                                {
+                                    logLine($"Ignoring mid-stream datagram: failed to rebuild pipeline for {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec} ({ex.Message}).");
+                                    loggedBadFormatMidStream = true;
+                                }
+                                continue;
+                            }
                         }
 
                         int payload = received - WireProtocol.HeaderBytes;

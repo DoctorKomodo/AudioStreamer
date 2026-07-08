@@ -43,9 +43,15 @@ namespace AudioStreamer
                 {
                     int len = encoder.Encode(accumulator, frameSamples, encodeBuffer, encodeBuffer.Length);
                     // libopus returns a negative error code on failure; fail loud so the caller's try/catch
-                    // logs it rather than emitting a negative/garbage length.
+                    // logs it rather than emitting a negative/garbage length. Reset accumFill BEFORE throwing
+                    // (not just on the success path) so a failed encode still drains the accumulator instead of
+                    // wedging it full — otherwise every subsequent Push re-enters this block, throws again, and
+                    // never drains, flooding the sender's error log until a manual Stop/Start.
                     if (len < 0)
+                    {
+                        accumFill = 0;
                         throw new InvalidOperationException($"Opus encode failed with code {len}.");
+                    }
                     emit(encodeBuffer, 0, len);   // Opus payload starts at 0 of its own encode buffer
                     accumFill = 0;
                 }
