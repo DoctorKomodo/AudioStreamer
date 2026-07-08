@@ -16,6 +16,11 @@ namespace AudioStreamer
         private const int ReorderMaxWindowPackets = 64;
         private const int ReorderBaselineBytesPerSecond = 48000 * 2 * 2;   // 192000 B/s (16-bit stereo @ 48 kHz)
 
+        // Opus datagrams arrive at the frame rate (100/s at 10 ms), not the PCM MTU cadence, so the PCM
+        // byte-rate window formula mis-sizes them (8 packets = 160 ms at 20 ms frames, past the drift cap).
+        // A fixed small count keeps give-up time bounded (10-80 ms across 2.5-20 ms frames), always < the cap.
+        private const int OpusReorderWindowPackets = 4;
+
         /// <summary>Reorder-buffer depth scaled to the stream's byte rate, keeping give-up time ~constant (~40 ms).</summary>
         public static int ComputeReorderWindow(WaveFormat format) =>
             Math.Clamp(ReorderBaseWindowPackets * format.AverageBytesPerSecond / ReorderBaselineBytesPerSecond,
@@ -46,6 +51,9 @@ namespace AudioStreamer
 
         // The active wire format code, set in BuildPipeline. The receive loop rebuilds when an incoming code differs.
         private byte currentFormatCode;
+        private CodecId currentCodec;
+        private IAudioDecoder decoder = null!;   // built alongside the pipeline
+        private byte[] pcmScratch = System.Array.Empty<byte>();   // decode/conceal output, sized for the largest frame
         // Log-once guard for an unknown code seen mid-stream (the InitializeReceiver guard's flag is a local there).
         private bool loggedBadFormatMidStream;
 
@@ -93,6 +101,8 @@ namespace AudioStreamer
             socket = null;
             cts?.Dispose();
             cts = null;
+            decoder?.Dispose();
+            decoder = null!;
         }
 
         // Builds (or rebuilds) WasapiOut around the existing underrun meter and starts playback. Single source of
@@ -187,15 +197,22 @@ namespace AudioStreamer
         // single-threaded (the only thread that touches those fields and calls AddSamples); only the WasapiOut
         // create/teardown inside BuildAndPlayOutput is serialized by outputLock (against Stop() / PlaybackStopped
         // recovery). Set the fields BEFORE BuildAndPlayOutput so the new WasapiOut is wired to the new buffer.
-        private void BuildPipeline(AudioFormats.Format fmt, byte code)
+        private void BuildPipeline(AudioFormats.Format fmt, byte code, CodecId codec)
         {
             currentFormatCode = code;
-            bufferedWaveProvider = new BufferedWaveProvider(AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels))
+            currentCodec = codec;
+            var waveFormat = AudioFormats.ToWaveFormat(fmt.SampleRate, fmt.BitDepth, fmt.Channels);
+            bufferedWaveProvider = new BufferedWaveProvider(waveFormat)
             {
                 BufferDuration = TimeSpan.FromMilliseconds(config.ReceiverAudioBufferMillisecondsLength),
                 DiscardOnBufferOverflow = true
             };
             underrunMeter = new UnderrunCountingWaveProvider(bufferedWaveProvider);
+            decoder?.Dispose();
+            decoder = CodecFactory.CreateDecoder(codec, waveFormat, logLine);
+            // Largest supported Opus frame (20 ms) worth of PCM, sized generously; PCM decode writes <= one datagram.
+            int maxFrameBytes = waveFormat.SampleRate / 50 * waveFormat.Channels * (waveFormat.BitsPerSample / 8);
+            pcmScratch = new byte[System.Math.Max(maxFrameBytes, WireProtocol.MaxUdpAudioBytes)];
             BuildAndPlayOutput();
         }
 
@@ -207,6 +224,22 @@ namespace AudioStreamer
                 overflows++;
             bufferedWaveProvider.AddSamples(buf, off, cnt);
         }
+
+        // Builds a ReorderBuffer whose emit decodes the payload through the active decoder into pcmScratch before
+        // EmitSamples, and whose onLost runs the decoder's concealment (Opus PLC; PCM returns 0 → nothing emitted).
+        // Reads the decoder/pcmScratch fields live, so a mid-stream rebuild re-points them without new delegates.
+        private ReorderBuffer MakeReorderBuffer(int window) => new ReorderBuffer(
+            window,
+            emit: (buf, off, cnt) =>
+            {
+                int bytes = decoder.Decode(buf, off, cnt, pcmScratch);
+                EmitSamples(pcmScratch, 0, bytes);
+            },
+            onLost: () =>
+            {
+                int bytes = decoder.Conceal(pcmScratch);   // Opus PLC; PCM returns 0
+                if (bytes > 0) EmitSamples(pcmScratch, 0, bytes);
+            });
 
         private void InitializeReceiver()
         {
@@ -239,7 +272,9 @@ namespace AudioStreamer
                             continue;
                         }
                         logLine($"Sample rate: {fmt.SampleRate}, Bit depth: {fmt.BitDepth}, Channels: {fmt.Channels} received from sender");
-                        BuildPipeline(fmt, code);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
+                        CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
+                        logLine($"Codec: {codec}");
+                        BuildPipeline(fmt, code, codec);   // sets currentFormatCode before ReceiveAudio runs — no first-packet double-build
                         Task.Run(ReceiveAudio, token);
                         break;
                     }
@@ -260,9 +295,11 @@ namespace AudioStreamer
             var token = cts!.Token;
             Socket socket = this.socket!;   // captured once; see InitializeReceiver for why (Stop() nulls the field)
 
-            int reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+            int reorderWindow = currentCodec == CodecId.Opus
+                ? OpusReorderWindowPackets
+                : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
             logLine($"Reorder window: {reorderWindow} packets");
-            var reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
+            var reorderBuffer = MakeReorderBuffer(reorderWindow);
 
             while (!token.IsCancellationRequested)
             {
@@ -272,7 +309,8 @@ namespace AudioStreamer
                     if (received > WireProtocol.HeaderBytes)
                     {
                         byte code = WireProtocol.ReadFormatCode(receiveBuffer);
-                        if (code != currentFormatCode)
+                        CodecId codec = WireProtocol.ReadCodec(receiveBuffer);
+                        if (code != currentFormatCode || codec != currentCodec)
                         {
                             if (AudioFormats.FromCode(code) is not { } newFmt)
                             {
@@ -286,12 +324,14 @@ namespace AudioStreamer
                                 continue;
                             }
 
-                            // Valid new format: rebuild the whole pipeline BEFORE feeding this datagram, so no
+                            // Valid new format or codec: rebuild the whole pipeline BEFORE feeding this datagram, so no
                             // old-format-aligned bytes land in the new buffer. Single-threaded loop => atomic vs AddSamples.
-                            logLine($"Wire format changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch; rebuilding output.");
-                            BuildPipeline(newFmt, code);
-                            reorderWindow = ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
-                            reorderBuffer = new ReorderBuffer(reorderWindow, EmitSamples);
+                            logLine($"Wire format/codec changed to {newFmt.SampleRate}Hz {newFmt.BitDepth}bit {newFmt.Channels}ch {codec}; rebuilding.");
+                            BuildPipeline(newFmt, code, codec);
+                            reorderWindow = codec == CodecId.Opus
+                                ? OpusReorderWindowPackets
+                                : ComputeReorderWindow(bufferedWaveProvider.WaveFormat);
+                            reorderBuffer = MakeReorderBuffer(reorderWindow);
                             logLine($"Reorder window: {reorderWindow} packets");
                         }
 
