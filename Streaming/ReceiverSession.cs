@@ -49,6 +49,11 @@ namespace AudioStreamer
         private long payloadBytes;
         private double minBacklogMs = double.MaxValue;
         private int maxLatencyMs;
+        private int prerollMs;   // silence pre-buffered before playback (drift/jitter cushion); clamped in Start()
+        // Underrun diagnostics: a session total and the gap between blips, so the log shows how far apart the
+        // drift/jitter underruns actually are (the per-second underrun/s tick alone is easy to miss).
+        private int totalUnderruns;
+        private readonly System.Diagnostics.Stopwatch underrunGapTimer = new();
 
         // The active wire format code, set in BuildPipeline. The receive loop rebuilds when an incoming code differs.
         private byte currentFormatCode;
@@ -72,6 +77,11 @@ namespace AudioStreamer
         public void Start()
         {
             maxLatencyMs = config.ReceiverMaxLatencyMilliseconds;
+            // Keep the preroll under the drift cap, or TrimBacklog would immediately trim the cushion away.
+            prerollMs = Math.Max(0, maxLatencyMs > 0
+                ? Math.Min(config.ReceiverPrerollMilliseconds, maxLatencyMs)
+                : config.ReceiverPrerollMilliseconds);
+            underrunGapTimer.Restart();
             var client = new UdpClient(config.Port);
             client.Client.ReceiveBufferSize = WireProtocol.SocketBufferBytes;
             client.Client.IOControl(WireProtocol.SIO_UDP_CONNRESET, new byte[4], null);
@@ -124,7 +134,13 @@ namespace AudioStreamer
         // rebuild after a device outage resumes at ~0 backlog rather than dumping the piled-up backlog at once.
         // Constructed here (background thread) so WasapiOut captures no SynchronizationContext and PlaybackStopped
         // fires off the UI thread.
-        private void BuildAndPlayOutput()
+        //
+        // preroll: when true, pre-fill the buffer with prerollMs of silence before Play() so playback starts with
+        // a cushion (WasapiOut drains the silence while real audio queues behind it, establishing a ~prerollMs
+        // backlog) — this is what keeps normal clock drift/jitter from bottoming the buffer out. Only the caller on
+        // the receive thread (BuildPipeline) passes true; the device-recovery caller (RestartOutput, a background
+        // thread) passes false so we never AddSamples off the receive thread (the buffer is single-writer).
+        private void BuildAndPlayOutput(bool preroll)
         {
             lock (outputLock)
             {
@@ -143,6 +159,17 @@ namespace AudioStreamer
                     wasapiOut = null;
                 }
                 bufferedWaveProvider.ClearBuffer();   // no-op on first build (buffer empty); live-edge flush on rebuild
+                if (preroll && prerollMs > 0)
+                {
+                    var fmt = bufferedWaveProvider.WaveFormat;
+                    int silenceBytes = fmt.AverageBytesPerSecond * prerollMs / 1000;
+                    silenceBytes -= silenceBytes % fmt.BlockAlign;   // whole frames only
+                    if (silenceBytes > 0)
+                    {
+                        bufferedWaveProvider.AddSamples(new byte[silenceBytes], 0, silenceBytes);
+                        logLine($"Preroll: buffered {prerollMs} ms of silence before playback (drift/jitter cushion).");
+                    }
+                }
                 var output = new WasapiOut(AudioClientShareMode.Shared, config.ReceiverAudioLatencyMilliseconds);
                 output.Init(underrunMeter);
                 output.PlaybackStopped += OnPlaybackStopped;
@@ -188,7 +215,7 @@ namespace AudioStreamer
                     try
                     {
                         if (!isRunning || token.IsCancellationRequested) return;
-                        BuildAndPlayOutput();
+                        BuildAndPlayOutput(preroll: false);   // background thread — must not write to the single-writer buffer
                         logLine("Receiver output restarted.");
                         return;
                     }
@@ -237,7 +264,7 @@ namespace AudioStreamer
             // Largest supported Opus frame (20 ms) worth of PCM, sized generously; PCM decode writes <= one datagram.
             int maxFrameBytes = waveFormat.SampleRate / 50 * waveFormat.Channels * (waveFormat.BitsPerSample / 8);
             pcmScratch = new byte[System.Math.Max(maxFrameBytes, WireProtocol.MaxUdpAudioBytes)];
-            BuildAndPlayOutput();
+            BuildAndPlayOutput(preroll: true);   // receive thread — safe to pre-fill the buffer with silence
         }
 
         // ReorderBuffer emit target. Reads the bufferedWaveProvider field live, so a rebuild that swaps the field
@@ -426,10 +453,18 @@ namespace AudioStreamer
             // MUST NOT SWAP: Exchange() returns (Reorders, Losses) but ForReceiver wants (..., lostPerSec, reorderPerSec, ...).
             // So the call below passes `losses, reorders` in that order — same as the original (source line 463). Do not "tidy".
             var (reorders, losses) = sequenceTracker.Exchange();
+            int underruns = underrunMeter?.ExchangeUnderruns() ?? 0;
+            if (underruns > 0)
+            {
+                totalUnderruns += underruns;
+                logLine($"Underrun blip: {underruns} this interval, {totalUnderruns} total this session; " +
+                        $"{underrunGapTimer.Elapsed.TotalSeconds:F0}s since the previous underrun.");
+                underrunGapTimer.Restart();
+            }
             report(DiagnosticsSnapshot.ForReceiver(
                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
                 packets, payloadBytes / 1024, overflows, resyncs, losses, reorders,
-                underrunMeter?.ExchangeUnderruns() ?? 0, minBacklog, currentCodec));
+                underruns, minBacklog, currentCodec));
             packets = 0; payloadBytes = 0; overflows = 0; resyncs = 0;
             minBacklogMs = double.MaxValue;
             logTimer.Restart();
