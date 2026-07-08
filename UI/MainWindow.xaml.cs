@@ -74,7 +74,14 @@ namespace AudioStreamer
 
         private void OnDiagnostics(DiagnosticsSnapshot snapshot)
         {
-            Dispatcher.BeginInvoke((Action)(() => DiagnosticsText.Text = snapshot.ToCompactLine()));
+            // Prefix the active codec on the sender, where Config.Codec is authoritative. The receiver
+            // auto-detects the codec per datagram and doesn't surface it here, so we don't assert a
+            // (possibly stale) config value in receiver mode.
+            var cfg = audioStreamerLogic.CurrentConfig;
+            string prefix = cfg.Mode == AudioStreamerLogic.ModeType.Sender
+                ? $"codec={cfg.Codec.ToString().ToLowerInvariant()} "
+                : "";
+            Dispatcher.BeginInvoke((Action)(() => DiagnosticsText.Text = prefix + snapshot.ToCompactLine()));
         }
 
         // A session raises this while it is (re)acquiring its audio device. Reflect it in the status line so a
