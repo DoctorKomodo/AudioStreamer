@@ -50,6 +50,10 @@ namespace AudioStreamer
         private double minBacklogMs = double.MaxValue;
         private int maxLatencyMs;
         private int prerollMs;   // silence pre-buffered before playback (drift/jitter cushion); clamped in Start()
+        // Set when an interval actually underruns (the buffer hit empty); drives a one-shot re-cushion once the
+        // stream is flowing cleanly again. Keying off a real underrun (never true in healthy cushioned playback,
+        // where min > 0) means the re-cushion can't false-fire on a normal dip into the cushion — no threshold to tune.
+        private bool starved;
         // Underrun diagnostics: a session total and the gap between blips, so the log shows how far apart the
         // drift/jitter underruns actually are (the per-second underrun/s tick alone is easy to miss).
         private int totalUnderruns;
@@ -450,6 +454,23 @@ namespace AudioStreamer
             resyncs++;
         }
 
+        // Low-water mirror of TrimBacklog: after a starvation (sender restart / network gap drained the buffer),
+        // top the backlog back up to the preroll cushion with silence so playback doesn't resume permanently at the
+        // fragile live edge (min ~0), where drift underruns return. Only the deficit is added, capped at prerollMs
+        // (<= the drift cap, so TrimBacklog won't immediately trim it). Runs on the receive thread (single-writer).
+        private void RecushionToPreroll()
+        {
+            var fmt = bufferedWaveProvider.WaveFormat;
+            int targetBytes = (int)((long)fmt.AverageBytesPerSecond * prerollMs / 1000);
+            int addBytes = targetBytes - bufferedWaveProvider.BufferedBytes;
+            addBytes -= addBytes % fmt.BlockAlign;   // whole frames only
+            if (addBytes <= 0)
+                return;   // already at/above the cushion (e.g. it refilled on its own) — nothing to do
+            bufferedWaveProvider.AddSamples(new byte[addBytes], 0, addBytes);
+            long addedMs = (long)addBytes * 1000 / fmt.AverageBytesPerSecond;
+            logLine($"Re-cushioned {addedMs} ms of silence after buffer starvation (restoring the {prerollMs} ms preroll).");
+        }
+
         private void ReportInterval()
         {
             double minBacklog = minBacklogMs == double.MaxValue ? bufferedWaveProvider.BufferedDuration.TotalMilliseconds : minBacklogMs;
@@ -463,6 +484,14 @@ namespace AudioStreamer
                 logLine($"Underrun blip: {underruns} this interval, {totalUnderruns} total this session; " +
                         $"{underrunGapTimer.Elapsed.TotalSeconds:F0}s since the previous underrun.");
                 underrunGapTimer.Restart();
+                starved = true;   // the buffer emptied; restore the cushion once the stream is flowing cleanly again
+            }
+            else if (starved && prerollMs > 0 && packets > 0)
+            {
+                // A clean interval (no underruns) with packets flowing = the starvation episode is over. Re-cushion
+                // once, then clear the flag so this fires at most once per episode (not on every post-blip interval).
+                RecushionToPreroll();
+                starved = false;
             }
             report(DiagnosticsSnapshot.ForReceiver(
                 bufferedWaveProvider.BufferedDuration.TotalMilliseconds,
