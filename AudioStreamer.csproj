@@ -26,4 +26,13 @@
     <EmbeddedResource Include="Resources\icon.ico" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The SDK default glob (**/*.cs) would otherwise pull the test project's sources into the app. -->
+    <Compile Remove="AudioStreamer.Tests\**" />
+    <EmbeddedResource Remove="AudioStreamer.Tests\**" />
+    <None Remove="AudioStreamer.Tests\**" />
+    <!-- Let the test project see internal types (WireProtocol, codec seam). -->
+    <InternalsVisibleTo Include="AudioStreamer.Tests" />
+  </ItemGroup>
+
 </Project>

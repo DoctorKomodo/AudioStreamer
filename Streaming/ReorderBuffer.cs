@@ -8,17 +8,23 @@ namespace AudioStreamer
     /// so playback never stalls indefinitely. Runs on the receive thread; allocates only when actually holding
     /// an out-of-order datagram.
     /// </summary>
+    /// <remarks>
+    /// When the optional <c>onLost</c> delegate is supplied, it fires once per genuinely-skipped sequence so a
+    /// stateful decoder can conceal exactly one frame per loss.
+    /// </remarks>
     public sealed class ReorderBuffer
     {
         private readonly int maxDepth;
         private readonly Action<byte[], int, int> emit;   // (buffer, offset, count) — feeds the audio buffer in order
+        private readonly Action? onLost;                  // fired once per genuinely-missing sequence (optional)
         private long nextSeq = -1;                         // unwrapped sequence we still owe the audio buffer
         private readonly SortedDictionary<long, byte[]> held = new();
 
-        public ReorderBuffer(int maxDepth, Action<byte[], int, int> emit)
+        public ReorderBuffer(int maxDepth, Action<byte[], int, int> emit, Action? onLost = null)
         {
             this.maxDepth = maxDepth;
             this.emit = emit;
+            this.onLost = onLost;
         }
 
         public void Add(byte seq, byte[] buffer, int offset, int count)
@@ -54,9 +60,12 @@ namespace AudioStreamer
             }
 
             EmitContiguous();
-            // Too many datagrams piled up behind a missing one: give up on it and skip ahead so audio keeps flowing.
+            // Too many datagrams piled up behind a missing one: give up on it and skip ahead so audio keeps
+            // flowing. Fire onLost once per skipped sequence (Opus decode is stateful — the decoder must
+            // advance by exactly the number of lost frames), then emit anything now contiguous.
             while (held.Count >= maxDepth)
             {
+                onLost?.Invoke();
                 nextSeq++;
                 EmitContiguous();
             }

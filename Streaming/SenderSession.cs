@@ -121,7 +121,8 @@ namespace AudioStreamer
 
                 // Reused across callbacks so the capture thread allocates nothing (a GC pause here == an audio
                 // dropout). The 1-byte format code is constant for the session, so write it once up front; the
-                // sequence byte at index 1 is overwritten per datagram.
+                // sequence byte at WireProtocol.SequenceByteOffset is overwritten per datagram. Byte 1 (the codec
+                // id) is left at its zero-initialized default = CodecId.Pcm for now.
                 byte[] sendBuffer = new byte[WireProtocol.HeaderBytes + maxChunk];
                 WireProtocol.WriteFormatCode(sendBuffer, AudioFormats.ToCode(config.SampleRate, config.BitsPerSample, channels));
 
