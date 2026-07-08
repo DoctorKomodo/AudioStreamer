@@ -20,8 +20,10 @@
     <!-- WASAPI capture/playback is all this app uses. The NAudio meta-package also drags in
          Midi/Asio/WinMM/WinForms assemblies we never touch; NAudio.Wasapi pulls only NAudio.Core. -->
     <PackageReference Include="NAudio.Wasapi" Version="2.3.0" />
-    <!-- Native libopus binding. Core = managed wrapper; the win-x64 native package ships opus.dll.
-         Windows-x64-only app, so we skip the all-platforms meta-package. -->
+    <!-- Native libopus binding. Core = managed wrapper; OpusSharp.Natives is the only native
+         package and carries every RID (android/ios/linux/osx/win/wasm). There is no win-x64-only
+         variant, so build-installer.ps1 publishes with -r win-x64 to ship just opus.dll and drop
+         the ~14 MB of foreign-platform natives. RuntimeIdentifiers (below) makes that restore clean. -->
     <PackageReference Include="OpusSharp.Core" Version="1.6.1.4" />
     <PackageReference Include="OpusSharp.Natives" Version="1.6.1.4" />
     <!-- Config is (de)serialized with the runtime's built-in System.Text.Json — no extra package. -->

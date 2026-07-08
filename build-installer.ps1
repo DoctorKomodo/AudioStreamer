@@ -59,9 +59,15 @@ Write-Host ''
 Write-Host '==> Publishing AudioStreamer (framework-dependent)...' `
     -ForegroundColor Cyan
 
+# -r win-x64 --self-contained false: framework-dependent (still needs the .NET Desktop Runtime),
+# but RID-specific so only the win-x64 native libopus (opus.dll) ships. Without -r, a portable
+# publish copies OpusSharp.Natives' entire runtimes/ tree (android/ios/linux/osx/wasm, ~14 MB)
+# into the installer for no reason — this app is Windows-x64 only.
 $publishArgs = @(
     $Project,
     '--configuration', 'Release',
+    '--runtime', 'win-x64',
+    '--self-contained', 'false',
     '--output', $PublishDir
 )
 if ($Version) {
