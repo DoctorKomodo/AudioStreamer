@@ -22,7 +22,8 @@ namespace AudioStreamer
             public int ReceiverMaxLatencyMilliseconds { get; set; } = 150;   // drift cap; trims backlog to half this. 150 keeps lip-sync tight while leaving jitter headroom (400 was too laggy in the field)
             // Audio pre-buffered (as silence) before playback starts, giving a cushion so normal clock drift /
             // render-thread jitter doesn't drain the buffer to empty (an underrun blip). Higher = fewer blips but
-            // more latency; effectively clamped below ReceiverMaxLatencyMilliseconds so the drift cap can't trim it.
+            // more latency; clamped to at most ReceiverMaxLatencyMilliseconds (keep it comfortably below the cap
+            // so upward drift has room to stack on the cushion before the drift cap starts trimming).
             public int ReceiverPrerollMilliseconds { get; set; } = 60;
             public int SampleRate { get; set; } = 48000;
             public int BitsPerSample { get; set; } = 16;

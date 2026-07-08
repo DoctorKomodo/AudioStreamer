@@ -77,7 +77,8 @@ namespace AudioStreamer
         public void Start()
         {
             maxLatencyMs = config.ReceiverMaxLatencyMilliseconds;
-            // Keep the preroll under the drift cap, or TrimBacklog would immediately trim the cushion away.
+            // Clamp the preroll to at most the drift cap. (Keeping it comfortably below the cap is best — that
+            // leaves room for upward drift to stack on the cushion before TrimBacklog starts trimming.)
             prerollMs = Math.Max(0, maxLatencyMs > 0
                 ? Math.Min(config.ReceiverPrerollMilliseconds, maxLatencyMs)
                 : config.ReceiverPrerollMilliseconds);
@@ -162,7 +163,9 @@ namespace AudioStreamer
                 if (preroll && prerollMs > 0)
                 {
                     var fmt = bufferedWaveProvider.WaveFormat;
-                    int silenceBytes = fmt.AverageBytesPerSecond * prerollMs / 1000;
+                    // (long) intermediate: AverageBytesPerSecond can be ~6 MB/s (192 kHz/32-bit/8ch) and a
+                    // hand-edited preroll could be large enough to overflow a 32-bit multiply.
+                    int silenceBytes = (int)((long)fmt.AverageBytesPerSecond * prerollMs / 1000);
                     silenceBytes -= silenceBytes % fmt.BlockAlign;   // whole frames only
                     if (silenceBytes > 0)
                     {
