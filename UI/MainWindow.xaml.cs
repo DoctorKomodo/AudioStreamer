@@ -32,12 +32,7 @@ namespace AudioStreamer
 
         private void SetupTrayIcon()
         {
-            var asm = System.Reflection.Assembly.GetExecutingAssembly();
-            string? resName = System.Array.Find(asm.GetManifestResourceNames(),
-                n => n.EndsWith("icon.ico", System.StringComparison.OrdinalIgnoreCase));
-            System.Drawing.Icon icon = resName is not null
-                ? new System.Drawing.Icon(asm.GetManifestResourceStream(resName)!)
-                : System.Drawing.SystemIcons.Application;
+            System.Drawing.Icon icon = TrayIconLoader.Load(System.Windows.Forms.SystemInformation.SmallIconSize);
 
             var menu = new System.Windows.Forms.ContextMenuStrip();
             menu.Items.Add("Show AudioStreamer", null, (s, e) => ShowFromTray());
@@ -118,7 +113,11 @@ namespace AudioStreamer
             audioStreamerLogic.Stop();
             audioStreamerLogic.Diagnostics -= OnDiagnostics;
             audioStreamerLogic.WaitingForDevice -= OnWaitingForDevice;
+            // NotifyIcon.Dispose() does not dispose the Icon assigned to it, and
+            // TrayIconLoader.Load hands back an instance we own on both paths.
+            System.Drawing.Icon? trayIconImage = trayIcon?.Icon;
             trayIcon?.Dispose();
+            trayIconImage?.Dispose();
             trayIcon = null;
         }
 
