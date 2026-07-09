@@ -181,7 +181,33 @@ System.Drawing.Icon icon = TrayIconLoader.Load(System.Windows.Forms.SystemInform
 
 Leave the rest of `SetupTrayIcon` unchanged.
 
-Do **not** add disposal of `icon` here. `ExitApp` disposes the `NotifyIcon` but not its `Icon`; that pre-existing leak is explicitly out of scope for this change.
+- [ ] **Step 5b: Dispose the icon on exit**
+
+`TrayIconLoader.Load` returns a caller-owned `Icon` on **both** paths, so the
+caller must dispose it. Today nothing does: disposing a `NotifyIcon` does not
+dispose its `Icon`, so the GDI handle leaks. Without this step the port would
+also turn the fallback path — which previously handed back the shared
+`SystemIcons.Application` — into a leaked clone.
+
+In `UI/MainWindow.xaml.cs`, in the method containing `trayIcon?.Dispose()`
+(around line 121):
+
+```csharp
+// before
+trayIcon?.Dispose();
+trayIcon = null;
+
+// after
+// NotifyIcon.Dispose() does not dispose the Icon assigned to it, and
+// TrayIconLoader.Load hands back an instance we own on both paths.
+System.Drawing.Icon? trayIconImage = trayIcon?.Icon;
+trayIcon?.Dispose();
+trayIconImage?.Dispose();
+trayIcon = null;
+```
+
+Read the `Icon` *before* disposing the `NotifyIcon` — reading a disposed
+component's property is undefined.
 
 - [ ] **Step 6: Run the whole suite**
 
@@ -197,7 +223,10 @@ git commit -m "fix: load the 16px icon frame for the tray
 
 new Icon(stream) selects the .ico's default 32x32 frame and lets NotifyIcon
 downscale it, blurring the tray icon. Extract loading into TrayIconLoader and
-request SystemInformation.SmallIconSize so GDI+ picks the matching frame."
+request SystemInformation.SmallIconSize so GDI+ picks the matching frame.
+
+Also dispose the Icon on exit: NotifyIcon.Dispose() does not dispose it, and
+Load now returns an instance the caller owns on both paths."
 ```
 
 ---
