@@ -36,6 +36,18 @@ Key installer design points:
 - No "start with Windows" / tray integration (AudioStreamer is a plain windowed app). `AppPublisher`/`MyAppURL` in the `.iss` are **TODO placeholders** — set them before distributing.
 - `Resources\icon.ico` is the app/installer icon (`<ApplicationIcon>` in the csproj, `SetupIconFile` in the `.iss`).
 
+### Regenerating the icon
+
+```powershell
+python -m pip install Pillow            # dev-time only; not a build dependency
+python tools/generate-icon.py           # rewrites Resources/icon.ico
+python tools/generate-icon.py --preview # also dumps PNGs to build/icon-preview/
+```
+
+`Resources/icon.ico` is generated, not hand-drawn; `tools/generate-icon.py` is the source of truth and reproduces it byte-for-byte with the same Pillow version. It renders six frames (16, 32, 48, 64, 128, 256). The 16px and 32px frames are **redrawn from simplified geometry** — speaker plus two thickened arcs, positions snapped to whole device pixels — not downscaled from a large master; the three hairline arcs of the full glyph shatter into specks at tray size. `IconAssetTests` enforces this: the 16px frame must resolve into exactly three 8-connected bright masses with no component under 8 pixels. Do not relax those bounds to make a red test green — they mean the artwork regressed.
+
+The blue tile (corner radius 15.3% of width, gradient `#388EFF` → `#1457C8`) is shared with AudioLeash's icon so the two apps read as a family. The generator is a near-copy of `AudioLeash/tools/generate-icon.py`; a fix to one likely belongs in the other.
+
 ## Architecture
 
 **Project layout** — source is grouped into folders by responsibility (the SDK-style csproj globs `**/*.cs`/`**/*.xaml`, so there are no per-file includes to maintain; all types stay in the single flat `AudioStreamer` namespace regardless of folder):
