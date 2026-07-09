@@ -33,8 +33,24 @@ Key installer design points:
 - **Per-user install** to `%LOCALAPPDATA%\AudioStreamer` (`PrivilegesRequired=lowest`, no UAC). That location is writable, so the app's `config.json` (written next to the exe) works; the shortcut sets `WorkingDir={app}` and the uninstaller deletes `config.json`.
 - **Framework-dependent, RID-specific** publish (`dotnet publish -c Release -r win-x64 --self-contained false`), so the target machine needs the .NET 10 Windows Desktop Runtime. The `-r win-x64` is deliberate: `OpusSharp.Natives` is an all-platforms native package (there is no win-x64-only variant), so a *portable* publish would copy its entire `runtimes/` tree — android/ios/linux/osx/win-arm/wasm, ~14 MB — into the installer. RID-specific publish flattens just the win-x64 `opus.dll` next to the exe and drops the rest (publish output ~1.2 MB vs ~15 MB). There is intentionally **no installer-side runtime check**: a 32-bit Inno installer reading HKLM is redirected to `WOW6432Node` (where the x64 desktop runtime isn't listed), so the old check false-positived on machines that already had it. The apphost shows its own "install .NET" prompt with a download link on first launch if the runtime is genuinely missing. (Switch to self-contained by flipping `--self-contained false` → `true`; the `-r win-x64` is already present.)
 - **Version** flows from the csproj `<Version>` → published exe → read at compile time by the `.iss` via `GetVersionNumbersString`, so all three stay in sync.
-- No "start with Windows" / tray integration (AudioStreamer is a plain windowed app). `AppPublisher`/`MyAppURL` in the `.iss` are **TODO placeholders** — set them before distributing.
+- `AppPublisher`/`MyAppURL` in the `.iss` are **TODO placeholders** — set them before distributing. The installer's final page offers a "Start with Windows" checkbox, which sets the same registry key that `StartupService` and the app's own toggle manage.
 - `Resources\icon.ico` is the app/installer icon (`<ApplicationIcon>` in the csproj, `SetupIconFile` in the `.iss`).
+
+### Regenerating the icon
+
+```powershell
+python -m pip install Pillow            # dev-time only; not a build dependency
+python tools/generate-icon.py           # rewrites Resources/icon.ico
+python tools/generate-icon.py --preview # also dumps PNGs to build/icon-preview/
+```
+
+`Resources/icon.ico` is generated, not hand-drawn; `tools/generate-icon.py` is the source of truth. Re-running it reproduces the committed `.ico` byte-for-byte with the same Pillow version — a Pillow upgrade may change the encoded PNG bytes without changing the rendered pixels. It renders six frames (16, 32, 48, 64, 128, 256).
+
+The 16px and 32px frames are **redrawn from simplified geometry** — speaker plus two thickened arcs, positions snapped to whole device pixels — not downscaled from a large master. Rendered at 16px the full glyph's three hairline arcs fall below the brightness threshold and merge into the speaker, leaving one indistinct blob; that is exactly what the old icon did. Thin the arcs a little less and they crumble into flecks instead. `IconAssetTests` guards both failure modes: the 16px frame must hold at least 30 near-white pixels and resolve into exactly three **8-connected** bright masses (speaker + two arcs), none smaller than 8 pixels. The connectivity matters — a 1px curved stroke steps diagonally, so a 4-connected count would report correct arcs as a scatter of specks.
+
+Do not relax those bounds to make a red test green; they mean the artwork regressed. `SIMPLE["arc_stroke"]` = 0.09375 (1.5px at 16px) is likewise measured rather than chosen: at 1px the arcs shatter, at 2px they merge. It is deliberately *not* snapped to the pixel grid along with the positions.
+
+The blue tile (corner radius 15.3% of width, gradient `#388EFF` → `#1457C8`) is shared with AudioLeash's icon so the two apps read as a family. The generator is a near-copy of `AudioLeash/tools/generate-icon.py`; a fix to one likely belongs in the other.
 
 ## Architecture
 
