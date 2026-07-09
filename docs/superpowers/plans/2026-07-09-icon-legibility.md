@@ -765,30 +765,58 @@ Run: `dotnet test AudioStreamer.Tests`
 
 Expected: 27 + 4 = 31 passing, 0 failed.
 
-- [ ] **Step 4: Prove the guards actually catch the defect**
+- [ ] **Step 4: Prove the guards actually catch the defect — TWO mutations**
 
-A regression test nobody has watched fail is not yet a guard.
+A regression test nobody has watched fail is not yet a guard. The three guards
+fail on *different* defects, so one mutation cannot exercise them all. Run both.
 
-Temporarily set `SIMPLIFIED_UP_TO = 0` in `tools/generate-icon.py` (so every frame uses the hairline `FULL` geometry, reproducing the old defect), regenerate, and re-run.
+**Mutation A — the arcs vanish.** Set `SIMPLIFIED_UP_TO = 0` so every frame uses
+the hairline `FULL` geometry. At 16px those arcs fall below the brightness
+threshold entirely; they do not fragment, they disappear, leaving the speaker
+alone.
 
 ```bash
 python tools/generate-icon.py
 dotnet test AudioStreamer.Tests --filter FullyQualifiedName~IconAssetTests
 ```
 
-Expected: `SmallFrame_ResolvesIntoExactlyThreeMasses` **FAILS** (more than 3 masses), and `SmallFrame_HasNoCrumbledComponent` **FAILS** (a component of ~2-6 pixels). Record the verbatim output and the observed numbers. `SmallFrame_HasCrispWhitePixels` may also fail.
+Expected, measured: `masses=1 sizes=[14] near_white=12`.
+- `SmallFrame_ResolvesIntoExactlyThreeMasses` **FAILS** (Expected 3, Actual 1).
+- `SmallFrame_HasCrispWhitePixels` **FAILS** (12 < 30).
+- `SmallFrame_HasNoCrumbledComponent` **PASSES** — the single 14px component is
+  not crumbled. This is expected and is exactly why Mutation B is required.
 
-If either mass test *passes* on the broken artwork, stop and report BLOCKED — the guard does not work and papering over it defeats the task.
-
-Then revert `SIMPLIFIED_UP_TO` to `32`, regenerate, and confirm:
+**Mutation B — the arcs crumble.** Restore `SIMPLIFIED_UP_TO = 32` and instead
+set `SIMPLE["arc_stroke"] = 0.04` (thinner than the 0.09375 that was measured to
+work). The arcs now render, but break into flecks.
 
 ```bash
 python tools/generate-icon.py
-git status --short          # Resources/icon.ico must be unmodified
+dotnet test AudioStreamer.Tests --filter FullyQualifiedName~IconAssetTests
+```
+
+Expected, measured: `masses=3 sizes=[25, 3, 1] near_white=22`.
+- `SmallFrame_ResolvesIntoExactlyThreeMasses` **PASSES** — the count is 3, even
+  though two "masses" are a 3-pixel and a 1-pixel fleck. This is the failure
+  mode an exact count cannot see.
+- `SmallFrame_HasNoCrumbledComponent` **FAILS** (smallest component 1 < 8).
+- `SmallFrame_HasCrispWhitePixels` **FAILS** (22 < 30).
+
+If `SmallFrame_HasNoCrumbledComponent` does not fail under Mutation B, stop and
+report BLOCKED — the guard does not work, and papering over it defeats the task.
+
+Record the verbatim output and observed numbers for **both** mutations.
+
+Then revert both changes and confirm the tree is pristine:
+
+```bash
+python tools/generate-icon.py
+git status --short          # Resources/icon.ico and tools/generate-icon.py unmodified
+sha256sum Resources/icon.ico   # 6fde73ffab792863d68ac1b701dad0dc407d391daf352e947f70e398220e0330
 dotnet test AudioStreamer.Tests
 ```
 
-Do **not** commit the mutated icon.
+Do **not** commit either mutated icon.
 
 - [ ] **Step 5: Commit**
 
