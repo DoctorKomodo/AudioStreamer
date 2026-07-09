@@ -52,17 +52,35 @@ The **Sender** decides the audio format; the **Receiver** learns it automaticall
 - **Host Name** — the Receiver's IP address.
 - **Port** — UDP port to send to (must match the Receiver).
 - **Sender Audio Buffer (ms)** — capture buffer size; smaller = lower latency, larger = smoother.
-- **Sample Rate / Bits Per Sample / Channels** — the audio format to transmit (e.g. 48000 / 16 / 2).
+- **Audio Codec** — how the sound is sent over the network (**PCM** or **Opus** — see [Choosing a codec](#choosing-a-codec-pcm-or-opus) below).
+- **Opus Frame Size (ms)** — only used with the Opus codec; smaller = lower latency, larger = slightly more efficient. Ignored (greyed out) when PCM is selected.
+- **Sample Rate / Bits Per Sample / Channels** — the audio format to transmit (e.g. 48000 / 16 / 2). Leave **Channels** on **Auto (match source)** to follow your PC's own speaker setup (stereo, 5.1, and so on) automatically. These fields don't apply when the Opus codec is selected, which always sends CD-quality stereo.
 
 **Receiver:**
 - **Port** — UDP port to listen on (must match the Sender).
 - **Receiver Audio Buffer (ms)** — jitter buffer ceiling.
 - **Receiver Audio Latency (ms)** — output device latency.
 - **Receiver Max Latency (ms)** — caps how far audio may fall behind before the buffer is trimmed (see below).
+- **Receiver Preroll (ms)** — a small cushion of audio the Receiver keeps buffered before playback, so brief network hiccups don't cause dropouts. Raise it for a more resilient stream, lower it for tighter latency.
+
+The Receiver reads the codec and audio format from the incoming stream, so you never have to match these by hand — just set the format on the Sender.
 
 ### About latency and lip-sync
 
 The Sender and Receiver run on independent sound-card clocks that never tick at exactly the same rate, so over a long session the audio can gradually drift behind. **Receiver Max Latency (ms)** is the guard against this: when the playback backlog exceeds it, AudioStreamer trims the buffer back so the delay can't keep growing. Lower it for tighter sync (at the cost of an occasional brief blip when it resyncs); raise it for smoother playback with more tolerance for network jitter.
+
+### Choosing a codec (PCM or Opus)
+
+The **Audio Codec** setting on the Sender controls how sound travels over the network:
+
+- **PCM** sends the audio uncompressed. It's bit-for-bit exact and lets you pick any sample rate, bit depth, and channel count, but it uses the most bandwidth — best on a fast, quiet wired network.
+- **Opus** compresses the audio on the fly, using a small fraction of the bandwidth while staying transparent for everyday listening. It's the better choice on Wi-Fi or a busy network, and it recovers more gracefully from the occasional lost packet. Opus always streams high-quality stereo, so the Sample Rate / Bits / Channels fields don't apply while it's selected.
+
+If you're not sure, start with **Opus** — it's easier on the network and sounds great. Switch to **PCM** only if you specifically need an exact, uncompressed copy or a non-stereo channel layout.
+
+### Avoiding dropouts when a screen sleeps
+
+Windows switches off an HDMI/DisplayPort monitor's audio output when the monitor goes into power-saving, which pauses the stream on that machine until the display wakes. AudioStreamer resumes on its own once the device comes back, but for playback that never cuts out, point the audio at a device that stays awake — a built-in or USB sound device, or a [virtual audio cable](https://vb-audio.com/Cable/) — rather than the display's own audio output.
 
 ---
 
