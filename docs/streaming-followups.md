@@ -250,6 +250,39 @@ invoked directly with a bad host. Fix: parse the address into a local first
 (`var ip = IPAddress.Parse(...)`) — or wrap the socket setup so a throw disposes `client` —
 and only then `Connect`. Trivial; do it alongside item 15.
 
+## 18. Receiver ignored a default-output-device change  **[DONE]**
+
+Field-reported: on the receiver, switching the Windows output device gave silence until the
+stream was stopped and started again. Item 14's recovery does **not** cover this — it hangs
+off `PlaybackStopped`, and a default-device change raises no such event. NAudio's
+`WasapiOut(shareMode, latency)` resolves `GetDefaultAudioEndpoint(Render, Role.Console)` once
+in its constructor and renders there for life; when the default changes while the old endpoint
+is still present and enabled, WASAPI has no reason to invalidate the stream, so playback simply
+continues into the *previous* device. Confirming evidence: no `Receiver output stopped` line
+appears anywhere in the user's ~7.7k lines of `diagnostics.log`/`diagnostics.1.log` — the
+recovery path had never fired. The Stop/Start workaround works precisely because it constructs
+a fresh `WasapiOut`.
+
+Fix: `Streaming/DefaultRenderDeviceWatcher.cs`, an `IMMNotificationClient` registered in
+`ReceiverSession.Start()` and unregistered first thing in `Stop()`. `OnDefaultDeviceChanged`
+filters to `DataFlow.Render` + `Role.Console` and de-dupes by device id, then queues
+`OnDefaultRenderDeviceChanged` → `BuildAndPlayOutput(preroll: false)` on a task — never on the
+OS callback thread, and never letting an exception cross the COM boundary. Design points worth
+keeping: the **role filter** collapses the up-to-six notifications Windows fires per (flow,
+role) pair for one user action into a single rebuild (each rebuild costs an audible
+`ClearBuffer` + re-cushion), and `Role.Console` is exactly what `WasapiOut` binds; a **null
+device id** is recorded but not acted on (that is the device-loss case, and recording it is
+what makes a later return to the same device read as a change rather than a no-op); the
+rebuild **no-ops when `wasapiOut` is null**, since a not-yet-built pipeline and an in-progress
+`RestartOutput` poll both resolve the current default themselves. Registration failure is
+logged and non-fatal — the session still plays, just without device following.
+
+Validation: `DefaultRenderDeviceWatcherTests` (9 cases) drives the interface methods directly
+on an unstarted watcher, so the filter/de-dupe/dispose behaviour is covered headlessly with no
+COM registration or audio hardware; the switch itself is a user field test as usual. The
+**sender** deliberately has no watcher — its loopback capture is reported to end via
+`RecordingStopped` on a default-device change, which `RestartCapture` already handles.
+
 ---
 
 ## Wire protocol (current)
@@ -268,8 +301,9 @@ This grew from a 2-byte header (format code + sequence only) when Opus compressi
 
 All review items (1–9) plus the field-found underrun gap (10), loss/reorder
 classifier (11), reorder buffer (12), data-rate-scaled reorder window (13), and the
-session extraction + receiver output recovery (14), and the audio-format dropdowns +
-indexed wire code (which closed the first-packet guard, 16) are implemented. **Pending
+session extraction + receiver output recovery (14), the audio-format dropdowns +
+indexed wire code (which closed the first-packet guard, 16), and the receiver's
+default-output-device following (18) are implemented. **Pending
 [TODO]:** log-flood suppression on the hot-path catch blocks (15) and the sender
 `IPAddress.Parse` socket leak (17) — low-priority hardening deferred from the streaming and
 branch reviews. Remaining validation caveat: socket-level and real-code component tests plus

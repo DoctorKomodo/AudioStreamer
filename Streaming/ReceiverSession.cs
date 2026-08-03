@@ -36,6 +36,8 @@ namespace AudioStreamer
         private UdpClient? udpClient;
         private Socket? socket;
         private WasapiOut? wasapiOut;
+        // Follows Windows' default render endpoint so a device switch rebuilds the output (see OnDefaultRenderDeviceChanged).
+        private DefaultRenderDeviceWatcher? deviceWatcher;
         private BufferedWaveProvider bufferedWaveProvider = null!;   // built once the first packet reveals the format
         private UnderrunCountingWaveProvider? underrunMeter;
         private CancellationTokenSource? cts;
@@ -90,6 +92,10 @@ namespace AudioStreamer
             udpClient = client;
             cts = new CancellationTokenSource();
             isRunning = true;
+            // Subscribe before the first output is built: the watcher seeds itself from the current default
+            // endpoint, which is the one BuildAndPlayOutput will bind to, so no spurious first rebuild.
+            deviceWatcher = new DefaultRenderDeviceWatcher(OnDefaultRenderDeviceChanged, logLine);
+            deviceWatcher.Start();
             logTimer.Restart();
             // Captured so Stop() can join this before disposing the decoder — InitializeReceiver now runs
             // ReceiveAudio inline (see there), so this one task spans the whole receive-loop lifetime.
@@ -101,6 +107,10 @@ namespace AudioStreamer
         {
             isRunning = false;
             cts?.Cancel();                 // unblocks ReceiveFrom once the socket closes; loops observe the token
+            // Unregister before tearing the output down so no device-change rebuild is queued during teardown. A
+            // callback already in flight is harmless: its rebuild re-checks isRunning inside outputLock.
+            deviceWatcher?.Dispose();
+            deviceWatcher = null;
             lock (outputLock)
             {
                 var output = wasapiOut;
@@ -200,6 +210,44 @@ namespace AudioStreamer
                 RestartOutput(dead);     // disposes dead, then rebuilds on a poll
             else if (dead != null)
                 Task.Run(() => dead.Dispose());
+        }
+
+        // The user picked a different output device in Windows. Unlike device *loss*, this raises no
+        // PlaybackStopped: the endpoint we are rendering to is still present and enabled, so WASAPI leaves the
+        // stream alone and audio keeps going to the old device — silence from the new one. WasapiOut resolves its
+        // endpoint once in its constructor, so following the switch means rebuilding the output. This is the
+        // sibling of OnPlaybackStopped: same rebuild, different trigger.
+        private void OnDefaultRenderDeviceChanged(string deviceId)
+        {
+            // Off the OS notification thread — that callback must return promptly and must not block on outputLock
+            // (Stop() can hold it while stopping a device).
+            Task.Run(() =>
+            {
+                lock (outputLock)
+                {
+                    // No live output means there is nothing bound to the stale endpoint: either the pipeline hasn't
+                    // been built yet (the first packet's build resolves the current default), or RestartOutput is
+                    // mid-poll after a device loss (its next attempt does the same). Either way it lands on the new
+                    // default on its own, and rebuilding here would race that.
+                    if (!isRunning || wasapiOut == null)
+                        return;
+                }
+                try
+                {
+                    logLine("Default audio output device changed; moving receiver playback to it.");
+                    // preroll: false — background thread, and the buffer is single-writer (receive thread only).
+                    // BuildAndPlayOutput ClearBuffer()s, so the receive loop sees BufferedBytes == 0 on the next
+                    // datagram and re-cushions to the preroll there.
+                    BuildAndPlayOutput(preroll: false);
+                }
+                catch (Exception ex)
+                {
+                    // The new endpoint can briefly refuse activation (still initialising after the switch). Hand
+                    // off to the existing once-per-second poll rather than giving up.
+                    logLine($"Receiver output rebuild after device change failed ({ex.Message}); retrying...");
+                    RestartOutput(null);
+                }
+            });
         }
 
         // Rebuild WasapiOut after the OS tore the render device down (e.g. the receiver's monitor entered
