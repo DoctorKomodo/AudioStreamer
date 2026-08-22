@@ -94,7 +94,7 @@ namespace AudioStreamer
             isRunning = true;
             // Subscribe before the first output is built: the watcher seeds itself from the current default
             // endpoint, which is the one BuildAndPlayOutput will bind to, so no spurious first rebuild.
-            deviceWatcher = new DefaultRenderDeviceWatcher(OnDefaultRenderDeviceChanged, logLine);
+            deviceWatcher = new DefaultRenderDeviceWatcher(OnDefaultRenderDeviceChanged, logLine, Role.Console);
             deviceWatcher.Start();
             logTimer.Restart();
             // Captured so Stop() can join this before disposing the decoder — InitializeReceiver now runs

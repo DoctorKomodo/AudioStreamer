@@ -14,8 +14,8 @@ namespace AudioStreamer.Tests
     /// </summary>
     public class DefaultRenderDeviceWatcherTests
     {
-        private static DefaultRenderDeviceWatcher Watcher(List<string> changes) =>
-            new DefaultRenderDeviceWatcher(changes.Add, _ => { });
+        private static DefaultRenderDeviceWatcher Watcher(List<string> changes, Role watchedRole = Role.Console) =>
+            new DefaultRenderDeviceWatcher(changes.Add, _ => { }, watchedRole);
 
         [Fact]
         public void RenderConsoleChange_RaisesTheCallback()
@@ -108,6 +108,20 @@ namespace AudioStreamer.Tests
             watcher.OnPropertyValueChanged("{device-c}", default);
 
             Assert.Empty(changes);
+        }
+
+        [Fact]
+        public void WatchingMultimediaRole_ConsoleRoleChangeIsIgnoredButMultimediaIsNot()
+        {
+            // The sender's loopback capture binds Role.Multimedia (unlike WasapiOut's Role.Console), so a watcher
+            // constructed for it must filter on that role instead.
+            var changes = new List<string>();
+            var watcher = Watcher(changes, watchedRole: Role.Multimedia);
+
+            watcher.OnDefaultDeviceChanged(DataFlow.Render, Role.Console, "{device-console}");
+            watcher.OnDefaultDeviceChanged(DataFlow.Render, Role.Multimedia, "{device-multimedia}");
+
+            Assert.Equal(new[] { "{device-multimedia}" }, changes);
         }
 
         [Fact]
