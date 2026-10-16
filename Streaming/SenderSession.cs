@@ -30,6 +30,11 @@ namespace AudioStreamer
         private UdpClient? udpClient;
         private WasapiCapture? waveSource;
         private IAudioEncoder? encoder;
+        // Follows Windows' default render endpoint so a device switch rebuilds the capture (see
+        // OnDefaultRenderDeviceChanged). Watches Role.Multimedia, the role the loopback capture binds
+        // (TryGetDefaultRenderInfo / TweakedWasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice) — not
+        // Role.Console, which is what WasapiOut binds on the receiver side.
+        private DefaultRenderDeviceWatcher? deviceWatcher;
 
         public SenderSession(AudioStreamerLogic.Config config, Action<string> logLine, Action<DiagnosticsSnapshot> report, Action<bool> reportWaiting)
         {
@@ -51,6 +56,10 @@ namespace AudioStreamer
             // abort the start — and because the failure path never logged, it did so invisibly, leaving the
             // sender idle with an empty log until a manual Start. Retrying rides out both transients.
             isRunning = true;
+            // Subscribe before the first capture is built: the watcher seeds itself from the current default
+            // endpoint, which is the one StartCapture will bind to, so no spurious first rebuild.
+            deviceWatcher = new DefaultRenderDeviceWatcher(OnDefaultRenderDeviceChanged, logLine, Role.Multimedia);
+            deviceWatcher.Start();
             try
             {
                 OpenSocket();
@@ -83,6 +92,10 @@ namespace AudioStreamer
         public void Stop()
         {
             isRunning = false;
+            // Unregister before tearing the capture down so no device-change rebuild is queued during teardown. A
+            // callback already in flight is harmless: its rebuild re-checks isRunning inside senderLock.
+            deviceWatcher?.Dispose();
+            deviceWatcher = null;
             StopCapture();
             udpClient?.Close();
             udpClient = null;
@@ -266,6 +279,49 @@ namespace AudioStreamer
                             loggedWaiting = true;
                         }
                     }
+                }
+            });
+        }
+
+        // The user picked a different output device in Windows. Unlike device *loss*, this raises no
+        // RecordingStopped: the endpoint we are capturing from is still present and enabled, so WASAPI leaves the
+        // stream alone and audio keeps being read from the old device until the session is restarted. The loopback
+        // capture resolves its endpoint once in its constructor, so following the switch means rebuilding it. This
+        // is the sibling of OnRecordingStopped: same rebuild, different trigger.
+        private void OnDefaultRenderDeviceChanged(string deviceId)
+        {
+            // Off the OS notification thread — that callback must return promptly and must not block on
+            // senderLock (Stop() can hold it while stopping the capture).
+            Task.Run(() =>
+            {
+                lock (senderLock)
+                {
+                    // No live capture means there is nothing bound to the stale endpoint: either the pipeline
+                    // hasn't been built yet (the first StartCapture resolves the current default), or
+                    // RestartCapture is already mid-poll after a device loss (its next attempt does the same).
+                    // Either way it lands on the new default on its own, and rebuilding here would race that.
+                    if (!isRunning || waveSource == null)
+                        return;
+                }
+                try
+                {
+                    logLine("Default audio output device changed; moving sender capture to it.");
+                    lock (senderLock)
+                    {
+                        // Re-check isRunning INSIDE the lock so this rebuild is atomic against Stop(), which also
+                        // takes senderLock — mirrors the receiver's BuildAndPlayOutput re-check.
+                        if (!isRunning)
+                            return;
+                        StopCapture();    // tears down the old, still-live capture bound to the stale endpoint
+                        StartCapture();   // rebuilds against the current default device (reentrant lock)
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // The new endpoint can briefly refuse activation (still initialising after the switch). Hand
+                    // off to the existing once-per-second poll rather than giving up.
+                    logLine($"Sender capture rebuild after device change failed ({ex.Message}); retrying...");
+                    RestartCapture(null);
                 }
             });
         }

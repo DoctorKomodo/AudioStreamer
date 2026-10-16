@@ -6,12 +6,13 @@ namespace AudioStreamer
     /// <summary>
     /// Watches Windows' default *render* endpoint and reports when the user switches it.
     ///
-    /// Why this exists: <c>WasapiOut</c> resolves <c>GetDefaultAudioEndpoint(Render, Console)</c> once, in its
-    /// constructor, and then renders to that endpoint for its whole life. When the default output is changed while
-    /// the old endpoint is still present and enabled, WASAPI does *not* invalidate the stream — so no
-    /// <c>PlaybackStopped</c> fires and the existing device-loss recovery (OnPlaybackStopped -> RestartOutput) never
-    /// runs. Audio simply keeps going to the previous device, which sounds like silence from the new one until the
-    /// session is restarted. Endpoint notifications are the only way to see the change, so we subscribe to them.
+    /// Why this exists: both <c>WasapiOut</c> (<c>Role.Console</c>) and the sender's WASAPI loopback capture
+    /// (<c>Role.Multimedia</c>) resolve <c>GetDefaultAudioEndpoint(Render, role)</c> once, at construction, and then
+    /// stay bound to that endpoint for their whole life. When the default output is changed while the old endpoint
+    /// is still present and enabled, WASAPI does *not* invalidate the stream — so neither <c>PlaybackStopped</c> nor
+    /// <c>RecordingStopped</c> fires, and the existing device-loss recovery paths never run. Audio simply keeps
+    /// going to/from the previous device until the session is restarted. Endpoint notifications are the only way to
+    /// see the change, so we subscribe to them.
     ///
     /// Lifetime: construct, <see cref="Start"/> to register with the OS, <see cref="Dispose"/> to unregister. The
     /// enumerator is held in a field because disposing it would drop the registration. Constructing without
@@ -19,10 +20,11 @@ namespace AudioStreamer
     /// </summary>
     internal sealed class DefaultRenderDeviceWatcher : IMMNotificationClient, IDisposable
     {
-        // The role WasapiOut's default-device constructor binds. Windows raises OnDefaultDeviceChanged once per
-        // (flow, role) pair, so one click in Sound settings arrives as up to six callbacks; filtering to the one
-        // role we actually render on collapses that to a single rebuild.
-        private const Role WatchedRole = Role.Console;
+        // The role the caller's endpoint-binding API resolves once at construction (WasapiOut: Role.Console; the
+        // sender's loopback capture: Role.Multimedia). Windows raises OnDefaultDeviceChanged once per (flow, role)
+        // pair, so one click in Sound settings arrives as up to six callbacks; filtering to the one role the caller
+        // actually bound to collapses that to a single rebuild.
+        private readonly Role watchedRole;
 
         private readonly Action<string> onDefaultRenderDeviceChanged;
         private readonly Action<string> logLine;
@@ -35,10 +37,11 @@ namespace AudioStreamer
 
         private MMDeviceEnumerator? enumerator;
 
-        internal DefaultRenderDeviceWatcher(Action<string> onDefaultRenderDeviceChanged, Action<string> logLine)
+        internal DefaultRenderDeviceWatcher(Action<string> onDefaultRenderDeviceChanged, Action<string> logLine, Role watchedRole)
         {
             this.onDefaultRenderDeviceChanged = onDefaultRenderDeviceChanged;
             this.logLine = logLine;
+            this.watchedRole = watchedRole;
         }
 
         /// <summary>
@@ -57,7 +60,7 @@ namespace AudioStreamer
                     // device we are already rendering on can't trigger a pointless rebuild (which costs an audible
                     // ClearBuffer + re-cushion gap). A failure here just means the first notification is treated as
                     // a genuine change, which is the safe direction.
-                    lastDeviceId = mmEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, WatchedRole).ID;
+                    lastDeviceId = mmEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, watchedRole).ID;
                 }
                 catch { /* no default render endpoint right now — leave unseeded */ }
 
@@ -98,7 +101,7 @@ namespace AudioStreamer
             // notification thread must never be blocked.
             try
             {
-                if (flow != DataFlow.Render || role != WatchedRole)
+                if (flow != DataFlow.Render || role != watchedRole)
                     return;
 
                 lock (gate)
